@@ -1,16 +1,416 @@
-TRADE SUMMARY TERM SHEET
+# STEP-BY-STEP SETUP ON WORK LAPTOP
 
-Client: <<CLIENT_NAME>>
+Follow EXACTLY in this order.
 
-Loan Reference: <<LOAN_NAME>>
+---
 
-Trade Date: <<TRADE_DATE>>
+# STEP 1 — CREATE FOLDER STRUCTURE
 
-Notional Amount: <<NOTIONAL>>
+Create:
 
-Financing Terms: <<SPREAD>>
+```text id="aqg4v6"
+D:\TRS_Project\
+```
 
-Maturity Date: <<MATURITY_DATE>>
+Inside it create:
 
-This document serves as a preliminary transaction summary
-for the referenced loan TRS transaction.
+```text id="9c1hkm"
+Templates
+```
+
+and
+
+```text id="u8h8kq"
+Output
+```
+
+Final structure:
+
+```text id="0o2m55"
+D:\TRS_Project\
+│
+├── Templates\
+├── Output\
+```
+
+---
+
+# STEP 2 — CREATE EXCEL FILE
+
+Create Excel workbook.
+
+Save as:
+
+```text id="ajfzpb"
+TRS_Generator.xlsm
+```
+
+IMPORTANT:
+Must be:
+
+```text id="h4iykn"
+.xlsm
+```
+
+NOT:
+
+```text id="t3wxrq"
+.xlsx
+```
+
+Save inside:
+
+```text id="sm4l6j"
+D:\TRS_Project\
+```
+
+---
+
+# STEP 3 — CREATE SHEET
+
+Rename sheet to EXACTLY:
+
+```text id="y4xx3u"
+MAIN
+```
+
+IMPORTANT:
+Name must match code.
+
+---
+
+# STEP 4 — CREATE GLOBAL SECTION
+
+At top:
+
+| A           | B |
+| ----------- | - |
+| CLIENT_TO   |   |
+| CLIENT_CC   |   |
+| INTERNAL_TO |   |
+| INTERNAL_CC |   |
+
+Example:
+
+| A           | B                                                            |
+| ----------- | ------------------------------------------------------------ |
+| CLIENT_TO   | [abc@x.com](mailto:abc@x.com); [xyz@y.com](mailto:xyz@y.com) |
+| CLIENT_CC   | [legal@x.com](mailto:legal@x.com)                            |
+| INTERNAL_TO | [desk@x.com](mailto:desk@x.com)                              |
+| INTERNAL_CC | [ops@x.com](mailto:ops@x.com)                                |
+
+---
+
+# STEP 5 — CREATE TRADE TABLE
+
+Start from:
+
+```text id="1n7k4o"
+Row 7
+```
+
+Example:
+
+| A        | B            | C              | D           |
+| -------- | ------------ | -------------- | ----------- |
+| Variable | Client Email | Internal Email | TRS Trade 1 |
+
+---
+
+# STEP 6 — ADD VARIABLES
+
+From Row 8 onwards:
+
+| Variable                 | Client | Internal | Trade1               |
+| ------------------------ | ------ | -------- | -------------------- |
+| TOTAL_RETURN_PAYER       | Y      | Y        | Barclays Bank PLC    |
+| TOTAL_RETURN_RECEIVER    | Y      | Y        | Sona Master Fund     |
+| TRADE_DATE               | Y      | Y        | 12-May-26            |
+| REFERENCE_ENTITY         | Y      | Y        | Novares              |
+| REFERENCE_OBLIGATION     | N      | Y        | Novares DIP Facility |
+| DOCUMENTATION            | N      | Y        | TRS MCA              |
+| ORIGINAL_NOTIONAL_AMOUNT | Y      | Y        | €11,000,000          |
+
+etc.
+
+IMPORTANT:
+
+* no empty rows
+* no merged cells
+* no wrap text
+
+---
+
+# STEP 7 — CREATE TEMPLATE FILES
+
+Inside:
+
+```text id="05pwh8"
+D:\TRS_Project\Templates\
+```
+
+create:
+
+```text id="6bzq3n"
+TS_Template.docx
+Client_Email_Template.docx
+Internal_Email_Template.docx
+```
+
+---
+
+# STEP 8 — PASTE TS TEMPLATE
+
+Open:
+
+```text id="x8zy1w"
+TS_Template.docx
+```
+
+Paste your actual TS wording.
+
+Replace changing values with placeholders:
+
+Example:
+
+```text id="kq7xgk"
+<<TRADE_DATE>>
+<<REFERENCE_ENTITY>>
+<<ORIGINAL_NOTIONAL_AMOUNT>>
+```
+
+IMPORTANT:
+Placeholder names must EXACTLY match Excel variable names.
+
+---
+
+# STEP 9 — ENABLE DEVELOPER TAB
+
+Excel:
+
+* File
+* Options
+* Customize Ribbon
+* Tick:
+
+```text id="5dhfcb"
+Developer
+```
+
+---
+
+# STEP 10 — OPEN VBA EDITOR
+
+Press:
+
+```text id="03v56o"
+ALT + F11
+```
+
+---
+
+# STEP 11 — INSERT MODULE
+
+Inside VBA:
+
+* Insert
+* Module
+
+---
+
+# STEP 12 — PASTE COMPLETE VBA CODE
+
+Paste FULL code.
+
+Then:
+
+* save workbook
+
+---
+
+# STEP 13 — COMPILE VBA
+
+VERY IMPORTANT.
+
+Inside VBA:
+
+* Debug
+* Compile VBAProject
+
+If NO error:
+good.
+
+If error:
+VBA highlights problematic line.
+
+---
+
+# STEP 14 — CREATE BUTTONS
+
+Go back to Excel.
+
+Developer:
+
+* Insert
+* Button
+
+Create:
+
+# BUTTON 1
+
+Assign:
+
+```text id="z0ev7p"
+Add_Trade
+```
+
+Rename button:
+
+```text id="n6o1qq"
+Add Trade
+```
+
+---
+
+# BUTTON 2
+
+Assign:
+
+```text id="zjlwm8"
+Generate_All_Documents
+```
+
+Rename:
+
+```text id="9n7n2n"
+Generate Documents
+```
+
+---
+
+# STEP 15 — TEST ADD TRADE
+
+Click:
+
+```text id="wnr8fj"
+Add Trade
+```
+
+It should create:
+
+```text id="l5kkjlwm"
+TRS Trade 2
+```
+
+---
+
+# STEP 16 — TEST GENERATION
+
+Fill:
+
+* sample trade data
+* emails
+
+Then click:
+
+```text id="55o7ww"
+Generate Documents
+```
+
+---
+
+# EXPECTED OUTPUT
+
+Inside:
+
+```text id="dxmdx8"
+D:\TRS_Project\Output\
+```
+
+you should get:
+
+* PDF files
+
+And Outlook should open:
+
+* Client email draft
+* Internal email draft
+
+with:
+
+* tables
+* attachments
+* subjects
+* formatting
+
+---
+
+# IMPORTANT TROUBLESHOOTING
+
+# ISSUE 1 — Macro not showing
+
+Fix:
+
+* save as:
+
+```text id="t9n6t5"
+.xlsm
+```
+
+---
+
+# ISSUE 2 — Runtime Error 9
+
+Usually:
+sheet name wrong.
+
+Must be:
+
+```text id="2c5yzl"
+MAIN
+```
+
+---
+
+# ISSUE 3 — Word Template Not Found
+
+Check:
+
+```text id="mjlwm5"
+D:\TRS_Project\Templates\
+```
+
+---
+
+# ISSUE 4 — Outlook not opening
+
+Ensure:
+
+* Outlook installed
+* Outlook opened at least once
+
+---
+
+# ISSUE 5 — Compile Error
+
+Inside VBA:
+
+```text id="1bgvcw"
+Debug → Compile VBAProject
+```
+
+Fix highlighted line.
+
+---
+
+# STEP 17 — FINAL PRODUCTION SETUP
+
+Once prototype works:
+
+* replace dummy TS template with real one
+* replace sample data with actual trades
+* refine email wording
+* test multiple trades
+* test visibility flags
+
+Then your MVP is production-ready.
