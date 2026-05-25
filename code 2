@@ -1,0 +1,511 @@
+Option Explicit
+
+Const TRADE_HEADER_ROW As Long = 7
+Const VARIABLE_START_ROW As Long = 8
+
+Const VARIABLE_COLUMN As Long = 1
+Const CLIENT_VISIBILITY_COLUMN As Long = 2
+Const INTERNAL_VISIBILITY_COLUMN As Long = 3
+
+Const FIRST_TRADE_COLUMN As Long = 4
+
+Const TEMPLATE_PATH As String = "D:\TRS_Project\Templates\"
+Const OUTPUT_PATH As String = "D:\TRS_Project\Output\"
+
+'====================================================
+' ADD TRADE
+'====================================================
+
+Sub Add_Trade()
+
+    Dim ws As Worksheet
+    Dim lastCol As Long
+    Dim newCol As Long
+    Dim tradeNumber As Long
+
+    Set ws = Sheets("MAIN")
+
+    lastCol = ws.Cells(TRADE_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+
+    newCol = lastCol + 1
+
+    tradeNumber = newCol - 3
+
+    ws.Cells(TRADE_HEADER_ROW, newCol).Value = "TRS Trade " & tradeNumber
+
+    ws.Columns(lastCol).Copy
+    ws.Columns(newCol).PasteSpecial xlPasteFormats
+
+    Application.CutCopyMode = False
+
+    MsgBox "Trade Added"
+
+End Sub
+
+'====================================================
+' MAIN ENGINE
+'====================================================
+
+Sub Generate_All_Documents()
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    On Error GoTo ErrorHandler
+
+    Dim ws As Worksheet
+
+    Set ws = Sheets("MAIN")
+
+    Dim clientTo As String
+    Dim clientCC As String
+    Dim internalTo As String
+    Dim internalCC As String
+
+    clientTo = ws.Range("B2").Value
+    clientCC = ws.Range("B3").Value
+    internalTo = ws.Range("B4").Value
+    internalCC = ws.Range("B5").Value
+
+    Dim lastTradeCol As Long
+    Dim tradeCol As Long
+
+    lastTradeCol = ws.Cells(TRADE_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+
+    Dim pdfFiles() As String
+    Dim pdfCount As Long
+
+    ReDim pdfFiles(1 To lastTradeCol - 3)
+
+    pdfCount = 0
+
+    For tradeCol = FIRST_TRADE_COLUMN To lastTradeCol
+
+        If Trim(ws.Cells(TRADE_HEADER_ROW, tradeCol).Value) <> "" Then
+
+            pdfCount = pdfCount + 1
+
+            pdfFiles(pdfCount) = Generate_TS_PDF(ws, tradeCol)
+
+        End If
+
+    Next tradeCol
+
+    Generate_Client_Email ws, clientTo, clientCC, pdfFiles, pdfCount
+
+    Generate_Internal_Email ws, internalTo, internalCC, pdfFiles, pdfCount
+
+    MsgBox "All Documents Generated Successfully"
+
+Cleanup:
+
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+
+    Exit Sub
+
+ErrorHandler:
+
+    MsgBox "Error: " & Err.Description
+
+    Resume Cleanup
+
+End Sub
+
+'====================================================
+' TS PDF
+'====================================================
+
+Function Generate_TS_PDF(ws As Worksheet, tradeCol As Long) As String
+
+    Dim wdApp As Object
+    Dim wdDoc As Object
+
+    Set wdApp = CreateObject("Word.Application")
+
+    wdApp.Visible = False
+
+    Set wdDoc = wdApp.Documents.Open(TEMPLATE_PATH & "TS_Template.docx")
+
+    Dim lastRow As Long
+    Dim r As Long
+
+    lastRow = ws.Cells(ws.Rows.Count, VARIABLE_COLUMN).End(xlUp).Row
+
+    Dim variableName As String
+    Dim variableValue As String
+    Dim placeholder As String
+
+    For r = VARIABLE_START_ROW To lastRow
+
+        variableName = Trim(ws.Cells(r, VARIABLE_COLUMN).Value)
+
+        variableValue = Trim(ws.Cells(r, tradeCol).Value)
+
+        If variableName <> "" Then
+
+            placeholder = "<<" & variableName & ">>"
+
+            Word_Find_Replace wdDoc, placeholder, variableValue
+
+        End If
+
+    Next r
+
+    Word_Find_Replace wdDoc, "<<SIGNATURE>>", "Barclays SCT Team"
+
+    Dim receiver As String
+    Dim entity As String
+
+    receiver = Clean_File_Name(Get_Value(ws, tradeCol, "TOTAL_RETURN_RECEIVER"))
+
+    entity = Clean_File_Name(Get_Value(ws, tradeCol, "REFERENCE_ENTITY"))
+
+    Dim pdfPath As String
+
+    pdfPath = OUTPUT_PATH & receiver & " - " & entity & ".pdf"
+
+    wdDoc.ExportAsFixedFormat pdfPath, 17
+
+    wdDoc.Close False
+
+    wdApp.Quit
+
+    Generate_TS_PDF = pdfPath
+
+End Function
+
+'====================================================
+' CLIENT EMAIL
+'====================================================
+
+Sub Generate_Client_Email(ws As Worksheet, toList As String, ccList As String, pdfFiles() As String, pdfCount As Long)
+
+    Dim outlookApp As Object
+    Dim outlookMail As Object
+
+    Set outlookApp = CreateObject("Outlook.Application")
+
+    Set outlookMail = outlookApp.CreateItem(0)
+
+    outlookMail.To = toList
+    outlookMail.CC = ccList
+
+    outlookMail.Subject = Build_Client_Subject(ws)
+
+    outlookMail.htmlBody = Build_Client_Email_HTML(ws)
+
+    Dim i As Long
+
+    For i = 1 To pdfCount
+
+        outlookMail.Attachments.Add pdfFiles(i)
+
+    Next i
+
+    outlookMail.Display
+
+End Sub
+
+'====================================================
+' INTERNAL EMAIL
+'====================================================
+
+Sub Generate_Internal_Email(ws As Worksheet, toList As String, ccList As String, pdfFiles() As String, pdfCount As Long)
+
+    Dim outlookApp As Object
+    Dim outlookMail As Object
+
+    Set outlookApp = CreateObject("Outlook.Application")
+
+    Set outlookMail = outlookApp.CreateItem(0)
+
+    outlookMail.To = toList
+    outlookMail.CC = ccList
+
+    outlookMail.Subject = "Internal - " & Build_Client_Subject(ws)
+
+    outlookMail.htmlBody = Build_Internal_Email_HTML(ws)
+
+    Dim i As Long
+
+    For i = 1 To pdfCount
+
+        outlookMail.Attachments.Add pdfFiles(i)
+
+    Next i
+
+    outlookMail.Display
+
+End Sub
+
+'====================================================
+' SUBJECT
+'====================================================
+
+Function Build_Client_Subject(ws As Worksheet) As String
+
+    Build_Client_Subject = _
+    "Barclays / " & _
+    Get_Value(ws, FIRST_TRADE_COLUMN, "TOTAL_RETURN_RECEIVER") & _
+    " - " & _
+    Get_Value(ws, FIRST_TRADE_COLUMN, "REFERENCE_ENTITY") & _
+    " - TRS Recap"
+
+End Function
+
+'====================================================
+' CLIENT HTML
+'====================================================
+
+Function Build_Client_Email_HTML(ws As Worksheet) As String
+
+    Dim html As String
+
+    html = "<html><body style='font-family:Calibri;font-size:11pt;'>"
+
+    html = html & "<p>Sona Team,</p>"
+
+    html = html & "<p>Please find below the trade recap on the TRS trades referencing "
+
+    html = html & Get_Value(ws, FIRST_TRADE_COLUMN, "REFERENCE_OBLIGATION")
+
+    html = html & ".</p>"
+
+    html = html & "<p><b>TRS Trades:</b></p>"
+
+    html = html & Build_TRS_Table(ws, "CLIENT")
+
+    html = html & "<br><p><b>Bond Trades:</b></p>"
+
+    html = html & Build_Bond_Bullets(ws)
+
+    html = html & "<br><p>Thank you,</p>"
+
+    html = html & "</body></html>"
+
+    Build_Client_Email_HTML = html
+
+End Function
+
+'====================================================
+' INTERNAL HTML
+'====================================================
+
+Function Build_Internal_Email_HTML(ws As Worksheet) As String
+
+    Dim html As String
+
+    html = "<html><body style='font-family:Calibri;font-size:11pt;'>"
+
+    html = html & "<p>Team,</p>"
+
+    html = html & "<p>Please find below the internal recap for executed TRS trades.</p>"
+
+    html = html & "<p><b>TRS Trades:</b></p>"
+
+    html = html & Build_TRS_Table(ws, "INTERNAL")
+
+    html = html & "<br><p><b>Bond Trades:</b></p>"
+
+    html = html & Build_Bond_Bullets(ws)
+
+    html = html & "<br><p>Thank you,</p>"
+
+    html = html & "</body></html>"
+
+    Build_Internal_Email_HTML = html
+
+End Function
+
+'====================================================
+' DYNAMIC TABLE
+'====================================================
+
+Function Build_TRS_Table(ws As Worksheet, emailType As String) As String
+
+    Dim html As String
+
+    Dim lastTradeCol As Long
+    Dim lastRow As Long
+
+    Dim visibilityColumn As Long
+
+    If emailType = "CLIENT" Then
+        visibilityColumn = CLIENT_VISIBILITY_COLUMN
+    Else
+        visibilityColumn = INTERNAL_VISIBILITY_COLUMN
+    End If
+
+    lastTradeCol = ws.Cells(TRADE_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+
+    lastRow = ws.Cells(ws.Rows.Count, VARIABLE_COLUMN).End(xlUp).Row
+
+    Dim r As Long
+    Dim c As Long
+
+    html = "<table border='1' cellspacing='0' cellpadding='4' style='border-collapse:collapse;font-family:Calibri;font-size:11pt;'>"
+
+    html = html & "<tr style='background-color:#1F1F4E;color:white;'>"
+
+    html = html & "<th></th>"
+
+    For c = FIRST_TRADE_COLUMN To lastTradeCol
+
+        html = html & "<th>" & ws.Cells(TRADE_HEADER_ROW, c).Value & "</th>"
+
+    Next c
+
+    html = html & "</tr>"
+
+    For r = VARIABLE_START_ROW To lastRow
+
+        Dim visibilityValue As String
+
+        visibilityValue = UCase(Trim(ws.Cells(r, visibilityColumn).Value))
+
+        If visibilityValue = "Y" Then
+
+            html = html & "<tr>"
+
+            html = html & "<td><b>" & Format_Label(ws.Cells(r, VARIABLE_COLUMN).Value) & "</b></td>"
+
+            For c = FIRST_TRADE_COLUMN To lastTradeCol
+
+                html = html & "<td>" & ws.Cells(r, c).Value & "</td>"
+
+            Next c
+
+            html = html & "</tr>"
+
+        End If
+
+    Next r
+
+    html = html & "</table>"
+
+    Build_TRS_Table = html
+
+End Function
+
+'====================================================
+' BOND BULLETS
+'====================================================
+
+Function Build_Bond_Bullets(ws As Worksheet) As String
+
+    Dim html As String
+
+    Dim lastTradeCol As Long
+    Dim c As Long
+
+    lastTradeCol = ws.Cells(TRADE_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+
+    html = "<ul>"
+
+    For c = FIRST_TRADE_COLUMN To lastTradeCol
+
+        html = html & "<li>"
+
+        html = html & "Barclays buys "
+
+        html = html & Get_Value(ws, c, "ORIGINAL_NOTIONAL_AMOUNT")
+
+        html = html & " notional of "
+
+        html = html & Get_Value(ws, c, "REFERENCE_OBLIGATION")
+
+        html = html & " from "
+
+        html = html & Get_Value(ws, c, "TOTAL_RETURN_RECEIVER")
+
+        html = html & ".</li>"
+
+    Next c
+
+    html = html & "</ul>"
+
+    Build_Bond_Bullets = html
+
+End Function
+
+'====================================================
+' GET VALUE
+'====================================================
+
+Function Get_Value(ws As Worksheet, tradeCol As Long, variableName As String) As String
+
+    Dim lastRow As Long
+    Dim r As Long
+
+    lastRow = ws.Cells(ws.Rows.Count, VARIABLE_COLUMN).End(xlUp).Row
+
+    For r = VARIABLE_START_ROW To lastRow
+
+        If Trim(ws.Cells(r, VARIABLE_COLUMN).Value) = variableName Then
+
+            Get_Value = Trim(ws.Cells(r, tradeCol).Value)
+
+            Exit Function
+
+        End If
+
+    Next r
+
+    Get_Value = ""
+
+End Function
+
+'====================================================
+' WORD REPLACE
+'====================================================
+
+Sub Word_Find_Replace(wdDoc As Object, findText As String, replaceText As String)
+
+    With wdDoc.Content.Find
+
+        .Text = findText
+        .Replacement.Text = replaceText
+        .Wrap = 1
+        .Execute Replace:=2
+
+    End With
+
+End Sub
+
+'====================================================
+' CLEAN FILE NAME
+'====================================================
+
+Function Clean_File_Name(fileName As String) As String
+
+    fileName = Replace(fileName, "/", "-")
+    fileName = Replace(fileName, "\", "-")
+    fileName = Replace(fileName, ":", "-")
+    fileName = Replace(fileName, "*", "")
+    fileName = Replace(fileName, "?", "")
+    fileName = Replace(fileName, Chr(34), "")
+    fileName = Replace(fileName, "<", "")
+    fileName = Replace(fileName, ">", "")
+    fileName = Replace(fileName, "|", "")
+
+    Clean_File_Name = fileName
+
+End Function
+
+'====================================================
+' FORMAT LABEL
+'====================================================
+
+Function Format_Label(txt As String) As String
+
+    txt = Replace(txt, "_", " ")
+
+    Format_Label = WorksheetFunction.Proper(txt)
+
+End Function
+
