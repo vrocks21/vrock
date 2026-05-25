@@ -1,0 +1,215 @@
+Option Explicit
+
+Sub Generate_TRS_Documents()
+
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    
+    Dim outlookApp As Object
+    Dim outlookMail As Object
+    
+    Dim templatePath As String
+    Dim outputPath As String
+    
+    Dim clientName As String
+    Dim loanName As String
+    Dim notional As String
+    Dim spread As String
+    Dim tradeDate As String
+    Dim maturityDate As String
+    
+    Dim toEmail As String
+    Dim ccEmail As String
+    
+    Dim fileName As String
+    
+    Dim email1Body As String
+    Dim email2Body As String
+    
+    Dim fso As Object
+    Dim txtStream As Object
+
+    '========================================
+    ' READ INPUT VALUES FROM EXCEL
+    '========================================
+
+    clientName = Sheets("Input").Range("B1").Value
+    loanName = Sheets("Input").Range("B2").Value
+    notional = Sheets("Input").Range("B3").Value
+    spread = Sheets("Input").Range("B4").Value
+    tradeDate = Sheets("Input").Range("B5").Value
+    maturityDate = Sheets("Input").Range("B6").Value
+    
+    toEmail = Sheets("Input").Range("B7").Value
+    ccEmail = Sheets("Input").Range("B8").Value
+
+    '========================================
+    ' VALIDATION
+    '========================================
+
+    If clientName = "" Then
+        MsgBox "Client Name Missing"
+        Exit Sub
+    End If
+
+    If toEmail = "" Then
+        MsgBox "To Email Missing"
+        Exit Sub
+    End If
+
+    '========================================
+    ' FILE NAME
+    '========================================
+
+    fileName = clientName & "_" & _
+               Replace(loanName, " ", "_") & "_" & _
+               Format(tradeDate, "ddmmmyyyy") & "_TS"
+
+    '========================================
+    ' PATHS
+    '========================================
+
+    templatePath = "D:\TRS_Project\Templates\TS_Template.docx"
+
+    outputPath = "D:\TRS_Project\Output\"
+
+    '========================================
+    ' OPEN WORD
+    '========================================
+
+    Set wdApp = CreateObject("Word.Application")
+
+    wdApp.Visible = False
+
+    Set wdDoc = wdApp.Documents.Open(templatePath)
+
+    '========================================
+    ' REPLACE PLACEHOLDERS
+    '========================================
+
+    Call FindReplace(wdDoc, "<<CLIENT_NAME>>", clientName)
+    Call FindReplace(wdDoc, "<<LOAN_NAME>>", loanName)
+    Call FindReplace(wdDoc, "<<NOTIONAL>>", notional)
+    Call FindReplace(wdDoc, "<<SPREAD>>", spread)
+    Call FindReplace(wdDoc, "<<TRADE_DATE>>", tradeDate)
+    Call FindReplace(wdDoc, "<<MATURITY_DATE>>", maturityDate)
+
+    '========================================
+    ' SAVE WORD DOCUMENT
+    '========================================
+
+    wdDoc.SaveAs2 outputPath & fileName & ".docx"
+
+    '========================================
+    ' EXPORT PDF
+    '========================================
+
+    wdDoc.ExportAsFixedFormat _
+        OutputFileName:=outputPath & fileName & ".pdf", _
+        ExportFormat:=17
+
+    wdDoc.Close
+
+    wdApp.Quit
+
+    '========================================
+    ' OPEN FILE SYSTEM OBJECT
+    '========================================
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    '========================================
+    ' READ EMAIL TEMPLATE 1
+    '========================================
+
+    Set txtStream = fso.OpenTextFile("D:\TRS_Project\Templates\Email1_Template.txt", 1)
+
+    email1Body = txtStream.ReadAll
+
+    txtStream.Close
+
+    '========================================
+    ' REPLACE VARIABLES EMAIL 1
+    '========================================
+
+    email1Body = Replace(email1Body, "<<CLIENT_NAME>>", clientName)
+    email1Body = Replace(email1Body, "<<LOAN_NAME>>", loanName)
+    email1Body = Replace(email1Body, "<<NOTIONAL>>", notional)
+    email1Body = Replace(email1Body, "<<TRADE_DATE>>", tradeDate)
+
+    '========================================
+    ' CREATE OUTLOOK EMAIL 1
+    '========================================
+
+    Set outlookApp = CreateObject("Outlook.Application")
+
+    Set outlookMail = outlookApp.CreateItem(0)
+
+    outlookMail.To = toEmail
+    outlookMail.CC = ccEmail
+
+    outlookMail.Subject = "Loan TRS - " & clientName
+
+    outlookMail.Body = email1Body
+
+    outlookMail.Attachments.Add outputPath & fileName & ".pdf"
+
+    outlookMail.Display
+
+    '========================================
+    ' READ EMAIL TEMPLATE 2
+    '========================================
+
+    Set txtStream = fso.OpenTextFile("D:\TRS_Project\Templates\Email2_Template.txt", 1)
+
+    email2Body = txtStream.ReadAll
+
+    txtStream.Close
+
+    '========================================
+    ' REPLACE VARIABLES EMAIL 2
+    '========================================
+
+    email2Body = Replace(email2Body, "<<CLIENT_NAME>>", clientName)
+    email2Body = Replace(email2Body, "<<LOAN_NAME>>", loanName)
+    email2Body = Replace(email2Body, "<<SPREAD>>", spread)
+    email2Body = Replace(email2Body, "<<MATURITY_DATE>>", maturityDate)
+
+    '========================================
+    ' CREATE OUTLOOK EMAIL 2
+    '========================================
+
+    Set outlookMail = outlookApp.CreateItem(0)
+
+    outlookMail.To = toEmail
+    outlookMail.CC = ccEmail
+
+    outlookMail.Subject = "Recap - " & clientName
+
+    outlookMail.Body = email2Body
+
+    outlookMail.Attachments.Add outputPath & fileName & ".pdf"
+
+    outlookMail.Display
+
+    '========================================
+    ' SUCCESS MESSAGE
+    '========================================
+
+    MsgBox "Documents Generated Successfully!"
+
+End Sub
+
+
+Sub FindReplace(wdDoc As Object, findText As String, replaceText As String)
+
+    With wdDoc.Content.Find
+
+        .Text = findText
+        .Replacement.Text = replaceText
+        .Wrap = 1
+        .Execute Replace:=2
+
+    End With
+
+End Sub
