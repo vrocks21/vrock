@@ -1,0 +1,510 @@
+Option Explicit
+
+Const TRADE_HEADER_ROW As Long = 10
+Const VARIABLE_START_ROW As Long = 11
+
+Const VARIABLE_COLUMN As Long = 1
+Const CLIENT_VISIBILITY_COLUMN As Long = 2
+Const BOOKING_VISIBILITY_COLUMN As Long = 3
+
+Const FIRST_TRADE_COLUMN As Long = 4
+
+Const OUTPUT_PATH As String = "D:\TRS_Project\Output\"
+
+'====================================================
+' UPDATE TRADE COLUMNS
+'====================================================
+
+Sub Update_Trade_Columns()
+
+    Dim ws As Worksheet
+    Set ws = Sheets("MAIN")
+
+    Dim tradeCount As Long
+    tradeCount = ws.Range("B6").Value
+
+    Dim c As Long
+
+    ' CLEAR OLD HEADERS
+    For c = FIRST_TRADE_COLUMN To 50
+
+        ws.Cells(TRADE_HEADER_ROW, c).ClearContents
+
+    Next c
+
+    ' CREATE NEW HEADERS
+    For c = FIRST_TRADE_COLUMN To FIRST_TRADE_COLUMN + tradeCount - 1
+
+        ws.Cells(TRADE_HEADER_ROW, c).Value = "TRS Trade " & (c - 3)
+
+    Next c
+
+    MsgBox "Trade Columns Updated"
+
+End Sub
+
+'====================================================
+' GENERATE TS DOCUMENTS
+'====================================================
+
+Sub Generate_TS_Documents()
+
+    Application.ScreenUpdating = False
+
+    Dim wsMain As Worksheet
+    Dim wsTemplate As Worksheet
+
+    Set wsMain = Sheets("MAIN")
+    Set wsTemplate = Sheets("TS_TEMPLATE")
+
+    Dim lastTradeCol As Long
+    Dim tradeCol As Long
+
+    lastTradeCol = wsMain.Cells(TRADE_HEADER_ROW, wsMain.Columns.Count).End(xlToLeft).Column
+
+    For tradeCol = FIRST_TRADE_COLUMN To lastTradeCol
+
+        If Trim(wsMain.Cells(TRADE_HEADER_ROW, tradeCol).Value) <> "" Then
+
+            Generate_Single_TS wsMain, wsTemplate, tradeCol
+
+        End If
+
+    Next tradeCol
+
+    Application.ScreenUpdating = True
+
+    MsgBox "TS Documents Generated"
+
+End Sub
+
+'====================================================
+' GENERATE SINGLE TS
+'====================================================
+
+Sub Generate_Single_TS(wsMain As Worksheet, wsTemplate As Worksheet, tradeCol As Long)
+
+    Dim wdApp As Object
+    Dim wdDoc As Object
+
+    Set wdApp = CreateObject("Word.Application")
+
+    wdApp.Visible = False
+
+    Set wdDoc = wdApp.Documents.Add
+
+    Dim tempSheet As Worksheet
+
+    wsTemplate.Copy After:=wsTemplate
+
+    Set tempSheet = ActiveSheet
+
+    tempSheet.Name = "TEMP_TS_" & tradeCol
+
+    Dim usedRange As Range
+    Set usedRange = tempSheet.UsedRange
+
+    Dim cell As Range
+
+    For Each cell In usedRange
+
+        If InStr(cell.Value, "<<") > 0 Then
+
+            Dim variableName As String
+
+            variableName = Replace(cell.Value, "<<", "")
+            variableName = Replace(variableName, ">>", "")
+
+            cell.Value = Get_Value(wsMain, tradeCol, variableName)
+
+        End If
+
+    Next cell
+
+    usedRange.Copy
+
+    wdDoc.Content.PasteExcelTable False, False, False
+
+    Dim receiver As String
+    Dim entity As String
+
+    receiver = Clean_File_Name(Get_Value(wsMain, tradeCol, "TOTAL_RETURN_RECEIVER"))
+
+    entity = Clean_File_Name(Get_Value(wsMain, tradeCol, "REFERENCE_ENTITY"))
+
+    Dim docPath As String
+
+    docPath = OUTPUT_PATH & receiver & " - " & entity & ".docx"
+
+    wdDoc.SaveAs2 docPath
+
+    wdDoc.Close False
+
+    wdApp.Quit
+
+    Application.DisplayAlerts = False
+
+    tempSheet.Delete
+
+    Application.DisplayAlerts = True
+
+End Sub
+
+'====================================================
+' CLIENT EMAIL
+'====================================================
+
+Sub Generate_Client_Email()
+
+    Dim ws As Worksheet
+    Set ws = Sheets("MAIN")
+
+    Dim outlookApp As Object
+    Dim outlookMail As Object
+
+    Set outlookApp = CreateObject("Outlook.Application")
+
+    Set outlookMail = outlookApp.CreateItem(0)
+
+    outlookMail.To = ws.Range("B2").Value
+    outlookMail.CC = ws.Range("B3").Value
+
+    outlookMail.Subject = Build_Email_Subject(ws)
+
+    outlookMail.HTMLBody = Build_Client_HTML(ws)
+
+    outlookMail.Display
+
+End Sub
+
+'====================================================
+' BOOKING EMAIL
+'====================================================
+
+Sub Generate_Booking_Email()
+
+    Dim ws As Worksheet
+    Set ws = Sheets("MAIN")
+
+    Dim outlookApp As Object
+    Dim outlookMail As Object
+
+    Set outlookApp = CreateObject("Outlook.Application")
+
+    Set outlookMail = outlookApp.CreateItem(0)
+
+    outlookMail.To = ws.Range("B4").Value
+    outlookMail.CC = ws.Range("B5").Value
+
+    outlookMail.Subject = "Booking - " & Build_Email_Subject(ws)
+
+    outlookMail.HTMLBody = Build_Booking_HTML(ws)
+
+    outlookMail.Display
+
+End Sub
+
+'====================================================
+' EMAIL SUBJECT
+'====================================================
+
+Function Build_Email_Subject(ws As Worksheet) As String
+
+    Build_Email_Subject = _
+    "Barclays / " & _
+    Get_Value(ws, FIRST_TRADE_COLUMN, "TOTAL_RETURN_RECEIVER") & _
+    " - " & _
+    Get_Value(ws, FIRST_TRADE_COLUMN, "REFERENCE_ENTITY") & _
+    " - TRS Recap"
+
+End Function
+
+'====================================================
+' CLIENT EMAIL HTML
+'====================================================
+
+Function Build_Client_HTML(ws As Worksheet) As String
+
+    Dim html As String
+
+    html = "<html><body style='font-family:Calibri;font-size:11pt;'>"
+
+    html = html & "<p>Team,</p>"
+
+    html = html & "<p>Please find below the TRS recap.</p>"
+
+    html = html & Build_TRS_Table(ws, "CLIENT")
+
+    html = html & Build_Trade_Section(ws)
+
+    html = html & "<br><p>Thank you,</p>"
+
+    html = html & "</body></html>"
+
+    Build_Client_HTML = html
+
+End Function
+
+'====================================================
+' BOOKING EMAIL HTML
+'====================================================
+
+Function Build_Booking_HTML(ws As Worksheet) As String
+
+    Dim html As String
+
+    html = "<html><body style='font-family:Calibri;font-size:11pt;'>"
+
+    html = html & "<p>Team,</p>"
+
+    html = html & "<p>Please find below the booking recap.</p>"
+
+    html = html & Build_TRS_Table(ws, "BOOKING")
+
+    html = html & Build_Trade_Section(ws)
+
+    html = html & "<br><p>Thank you,</p>"
+
+    html = html & "</body></html>"
+
+    Build_Booking_HTML = html
+
+End Function
+
+'====================================================
+' TRADE SECTION
+'====================================================
+
+Function Build_Trade_Section(ws As Worksheet) As String
+
+    Dim tradeType As String
+
+    tradeType = ws.Range("B5").Value
+
+    Select Case tradeType
+
+        Case "Bond Trade"
+            Build_Trade_Section = Build_Bond_Trades(ws)
+
+        Case "Loan Trade"
+            Build_Trade_Section = Build_Loan_Trades(ws)
+
+        Case "Notes Trade"
+            Build_Trade_Section = Build_Notes_Trades(ws)
+
+        Case Else
+            Build_Trade_Section = ""
+
+    End Select
+
+End Function
+
+'====================================================
+' BOND TRADES
+'====================================================
+
+Function Build_Bond_Trades(ws As Worksheet) As String
+
+    Build_Bond_Trades = _
+    "<br><p><b>Bond Trades:</b></p>" & _
+    Build_Trade_Bullets(ws)
+
+End Function
+
+'====================================================
+' LOAN TRADES
+'====================================================
+
+Function Build_Loan_Trades(ws As Worksheet) As String
+
+    Build_Loan_Trades = _
+    "<br><p><b>Loan Trades:</b></p>" & _
+    Build_Trade_Bullets(ws)
+
+End Function
+
+'====================================================
+' NOTES TRADES
+'====================================================
+
+Function Build_Notes_Trades(ws As Worksheet) As String
+
+    Build_Notes_Trades = _
+    "<br><p><b>Notes Trades:</b></p>" & _
+    Build_Trade_Bullets(ws)
+
+End Function
+
+'====================================================
+' TRADE BULLETS
+'====================================================
+
+Function Build_Trade_Bullets(ws As Worksheet) As String
+
+    Dim html As String
+
+    html = "<ul>"
+
+    Dim lastTradeCol As Long
+    Dim c As Long
+
+    lastTradeCol = ws.Cells(TRADE_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+
+    For c = FIRST_TRADE_COLUMN To lastTradeCol
+
+        html = html & "<li>"
+
+        html = html & Get_Value(ws, c, "TOTAL_RETURN_PAYER")
+
+        html = html & " buys "
+
+        html = html & Get_Value(ws, c, "ORIGINAL_NOTIONAL_AMOUNT")
+
+        html = html & " of "
+
+        html = html & Get_Value(ws, c, "REFERENCE_OBLIGATION")
+
+        html = html & " from "
+
+        html = html & Get_Value(ws, c, "TOTAL_RETURN_RECEIVER")
+
+        html = html & ".</li>"
+
+    Next c
+
+    html = html & "</ul>"
+
+    Build_Trade_Bullets = html
+
+End Function
+
+'====================================================
+' BUILD TRS TABLE
+'====================================================
+
+Function Build_TRS_Table(ws As Worksheet, emailType As String) As String
+
+    Dim visibilityColumn As Long
+
+    If emailType = "CLIENT" Then
+        visibilityColumn = CLIENT_VISIBILITY_COLUMN
+    Else
+        visibilityColumn = BOOKING_VISIBILITY_COLUMN
+    End If
+
+    Dim html As String
+
+    html = "<table border='1' cellspacing='0' cellpadding='4' style='border-collapse:collapse;font-family:Calibri;font-size:11pt;'>"
+
+    Dim lastTradeCol As Long
+    Dim lastRow As Long
+
+    lastTradeCol = ws.Cells(TRADE_HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+
+    lastRow = ws.Cells(ws.Rows.Count, VARIABLE_COLUMN).End(xlUp).Row
+
+    Dim r As Long
+    Dim c As Long
+
+    html = html & "<tr style='background-color:#1F1F4E;color:white;'>"
+
+    html = html & "<th></th>"
+
+    For c = FIRST_TRADE_COLUMN To lastTradeCol
+
+        html = html & "<th>" & ws.Cells(TRADE_HEADER_ROW, c).Value & "</th>"
+
+    Next c
+
+    html = html & "</tr>"
+
+    For r = VARIABLE_START_ROW To lastRow
+
+        Dim visibilityValue As String
+
+        visibilityValue = UCase(Trim(ws.Cells(r, visibilityColumn).Value))
+
+        If visibilityValue = "Y" Then
+
+            html = html & "<tr>"
+
+            html = html & "<td><b>" & _
+            Format_Label(ws.Cells(r, VARIABLE_COLUMN).Value) & _
+            "</b></td>"
+
+            For c = FIRST_TRADE_COLUMN To lastTradeCol
+
+                html = html & "<td>" & ws.Cells(r, c).Value & "</td>"
+
+            Next c
+
+            html = html & "</tr>"
+
+        End If
+
+    Next r
+
+    html = html & "</table>"
+
+    Build_TRS_Table = html
+
+End Function
+
+'====================================================
+' GET VALUE
+'====================================================
+
+Function Get_Value(ws As Worksheet, tradeCol As Long, variableName As String) As String
+
+    Dim lastRow As Long
+    Dim r As Long
+
+    lastRow = ws.Cells(ws.Rows.Count, VARIABLE_COLUMN).End(xlUp).Row
+
+    For r = VARIABLE_START_ROW To lastRow
+
+        If Trim(ws.Cells(r, VARIABLE_COLUMN).Value) = variableName Then
+
+            Get_Value = Trim(ws.Cells(r, tradeCol).Value)
+
+            Exit Function
+
+        End If
+
+    Next r
+
+    Get_Value = ""
+
+End Function
+
+'====================================================
+' CLEAN FILE NAME
+'====================================================
+
+Function Clean_File_Name(fileName As String) As String
+
+    fileName = Replace(fileName, "/", "-")
+    fileName = Replace(fileName, "\", "-")
+    fileName = Replace(fileName, ":", "-")
+    fileName = Replace(fileName, "*", "")
+    fileName = Replace(fileName, "?", "")
+    fileName = Replace(fileName, Chr(34), "")
+    fileName = Replace(fileName, "<", "")
+    fileName = Replace(fileName, ">", "")
+    fileName = Replace(fileName, "|", "")
+
+    Clean_File_Name = fileName
+
+End Function
+
+'====================================================
+' FORMAT LABEL
+'====================================================
+
+Function Format_Label(txt As String) As String
+
+    txt = Replace(txt, "_", " ")
+
+    Format_Label = WorksheetFunction.Proper(txt)
+
+End Function
