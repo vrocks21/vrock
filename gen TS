@@ -1,0 +1,260 @@
+'====================================================
+' GENERATE TS DOCUMENTS
+'====================================================
+
+Sub Generate_TS_Documents()
+
+    Application.ScreenUpdating = False
+
+    Dim wsMain As Worksheet
+    Dim wsTemplate As Worksheet
+    Dim wdApp As Object
+
+    Set wsMain = Sheets("MAIN")
+    Set wsTemplate = Sheets("TS_TEMPLATE")
+
+    ' OPEN WORD
+    On Error Resume Next
+    Set wdApp = CreateObject("Word.Application")
+    On Error GoTo 0
+
+    If wdApp Is Nothing Then
+
+        MsgBox "Microsoft Word could not be opened.", vbCritical
+        Exit Sub
+
+    End If
+
+    wdApp.Visible = True
+
+    Dim lastTradeCol As Long
+    Dim tradeCol As Long
+
+    lastTradeCol = wsMain.Cells(10, wsMain.Columns.Count).End(xlToLeft).Column
+
+    For tradeCol = 4 To lastTradeCol
+
+        If Trim(wsMain.Cells(10, tradeCol).Value) <> "" Then
+
+            Generate_Single_TS wsMain, wsTemplate, tradeCol, wdApp
+
+        End If
+
+    Next tradeCol
+
+    Application.ScreenUpdating = True
+
+    MsgBox "TS Documents Opened"
+
+End Sub
+
+'====================================================
+' GENERATE SINGLE TS
+'====================================================
+
+Sub Generate_Single_TS(wsMain As Worksheet, _
+                       wsTemplate As Worksheet, _
+                       tradeCol As Long, _
+                       wdApp As Object)
+
+    On Error GoTo ErrorHandler
+
+    Dim wdDoc As Object
+    Set wdDoc = wdApp.Documents.Add
+
+    '================================================
+    ' COPY TEMPLATE SHEET
+    '================================================
+
+    Dim tempSheet As Worksheet
+
+    wsTemplate.Copy After:=wsTemplate
+
+    Set tempSheet = ActiveSheet
+
+    Application.DisplayAlerts = False
+
+    On Error Resume Next
+    tempSheet.Name = "TEMP_TS_" & tradeCol
+    On Error GoTo 0
+
+    Application.DisplayAlerts = True
+
+    '================================================
+    ' REPLACE VARIABLES
+    '================================================
+
+    Dim usedRange As Range
+    Set usedRange = tempSheet.UsedRange
+
+    Dim cell As Range
+    Dim variableName As String
+    Dim val As String
+
+    For Each cell In usedRange.Cells
+
+        If InStr(CStr(cell.Value), "<<") > 0 Then
+
+            variableName = CStr(cell.Value)
+
+            variableName = Replace(variableName, "<<", "")
+            variableName = Replace(variableName, ">>", "")
+
+            variableName = Trim(variableName)
+
+            val = Get_Value(wsMain, tradeCol, variableName)
+
+            If val <> "" Then
+                cell.Value = val
+            End If
+
+        End If
+
+    Next cell
+
+    '================================================
+    ' FIX ALIGNMENT ISSUE
+    '================================================
+
+    Dim r As Long
+    Dim lastRow As Long
+
+    lastRow = tempSheet.Cells(tempSheet.Rows.Count, 1).End(xlUp).Row
+
+    For r = 1 To lastRow
+
+        ' If left label cell blank
+        If Trim(tempSheet.Cells(r, 1).Value) = "" Then
+
+            ' Copy indentation/alignment from previous row
+            If r > 1 Then
+
+                tempSheet.Rows(r).HorizontalAlignment = _
+                tempSheet.Rows(r - 1).HorizontalAlignment
+
+            End If
+
+        End If
+
+    Next r
+
+    '================================================
+    ' COPY EXACT FORMATTING
+    '================================================
+
+    usedRange.Copy
+
+    wdDoc.Range(0, 0).PasteExcelTable _
+    LinkedToExcel:=False, _
+    WordFormatting:=False, _
+    RTF:=False
+
+    DoEvents
+
+    '================================================
+    ' PAGE FORMATTING
+    '================================================
+
+    With wdDoc.PageSetup
+
+        .TopMargin = wdApp.CentimetersToPoints(1.5)
+        .BottomMargin = wdApp.CentimetersToPoints(1.5)
+        .LeftMargin = wdApp.CentimetersToPoints(1.5)
+        .RightMargin = wdApp.CentimetersToPoints(1.5)
+
+    End With
+
+    '================================================
+    ' AUTO FIT TABLES
+    '================================================
+
+    Dim tbl As Object
+
+    For Each tbl In wdDoc.Tables
+
+        tbl.AutoFitBehavior 2
+
+    Next tbl
+
+    '================================================
+    ' DELETE TEMP SHEET
+    '================================================
+
+    Application.DisplayAlerts = False
+
+    tempSheet.Delete
+
+    Application.DisplayAlerts = True
+
+    wdApp.Activate
+
+    Exit Sub
+
+'================================================
+' ERROR HANDLER
+'================================================
+
+ErrorHandler:
+
+    MsgBox "Error in Generate_Single_TS:" & vbCrLf & _
+           Err.Description, vbCritical
+
+    On Error Resume Next
+
+    Application.DisplayAlerts = False
+
+    tempSheet.Delete
+
+    Application.DisplayAlerts = True
+
+End Sub
+
+'====================================================
+' GET VALUE FROM MAIN SHEET
+'====================================================
+
+Function Get_Value(ws As Worksheet, _
+                   tradeCol As Long, _
+                   variableName As String) As String
+
+    Dim lastRow As Long
+    Dim r As Long
+
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+    For r = 11 To lastRow
+
+        If Trim(UCase(ws.Cells(r, 1).Value)) = _
+           Trim(UCase(variableName)) Then
+
+            Get_Value = CStr(ws.Cells(r, tradeCol).Value)
+
+            Exit Function
+
+        End If
+
+    Next r
+
+    Get_Value = ""
+
+End Function
+
+'====================================================
+' CLEAN FILE NAME
+'====================================================
+
+Function Clean_File_Name(fileName As String) As String
+
+    fileName = Replace(fileName, "/", "-")
+    fileName = Replace(fileName, "\", "-")
+    fileName = Replace(fileName, ":", "-")
+    fileName = Replace(fileName, "*", "")
+    fileName = Replace(fileName, "?", "")
+    fileName = Replace(fileName, Chr(34), "")
+    fileName = Replace(fileName, "<", "")
+    fileName = Replace(fileName, ">", "")
+    fileName = Replace(fileName, "|", "")
+
+    Clean_File_Name = Trim(fileName)
+
+End Function
