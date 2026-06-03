@@ -1,0 +1,47 @@
+Let me read the report I just built so the summary is precise.
+
+Good — I have the full text. Now let me give you a sharp, presenter-ready summary and the strongest original insights you can own in conversation.
+
+---
+
+## The situation in two minutes
+
+AI has crossed from an equity story into a **credit and financing story**. The five biggest hyperscalers are spending roughly **$750bn on AI infrastructure in 2026** — a 67% year-on-year increase and the third straight year of 60%-plus growth. At those spending levels, operating cash flow no longer covers the bill. Oracle is spending **86% of its revenue on capex**, Meta 54%, and Amazon's free cash flow is projected to turn **negative** this year. So the marginal dollar of AI infrastructure is now **debt-funded** — and that is exactly where your desk lives.
+
+Bond markets are responding. Hyperscalers issued ~$121bn of US bonds in 2025, more than four times their historical average. Barclays' own house view is that 2026 US IG issuance could exceed **$2 trillion** — a post-COVID record. Beyond bonds, a new private-credit and SPV channel has emerged, with deals like **Meta's $30bn Hyperion vehicle** pioneering off-balance-sheet data-centre financing.
+
+For the EU Fund Financing desk, this means: more collateral, more leveraged demand for that collateral via TRS and repo, and more revenue. But it also means every product on the desk is now linked to **one concentrated theme** — which, if it reverses, moves everything at once.
+
+---
+
+## Your insights — things you can say you developed
+
+These are the non-obvious, analytically defensible points that show original thinking:
+
+**1. "AI became an infrastructure story, not a software story — and that changes everything about how it's financed."**
+Software is asset-light and self-funding. Infrastructure is asset-heavy, long-duration, and capital-market-dependent. The moment the build moved from algorithms to data centres, GPUs and power grids, the financing burden shifted from retained earnings to debt markets. That's a structural shift, not a cyclical one — and it's why we're suddenly relevant to a technology theme.
+
+**2. "The rating on an SPV is not the same as the rating on a corporate bond, even if they're both A+."**
+The Meta Hyperion structure got an A+ — yet priced at 6.58%, close to high-yield. That gap exists because the A+ rests almost entirely on one thing: Meta continuing to pay the lease. That's not diversified cash flow, it's a single sponsor commitment at ~90% leverage. When you finance against that as collateral, you're taking credit risk on the sponsor, not the asset — and your haircut should reflect that, not the headline rating.
+
+**3. "The equity-credit divergence on Oracle and CoreWeave is your single best early-warning indicator."**
+Equity markets are still pricing the growth narrative. Credit markets are not — Oracle's 5-year CDS is at 2009-type levels, and CoreWeave's implies a ~42% five-year default probability. When equity and credit diverge this sharply on the same name, credit is usually the smarter market. Watching that divergence in real time is more useful than any lagging financial model.
+
+**4. "Circular financing inflates the headline numbers."**
+NVIDIA invests in OpenAI → OpenAI buys compute from CoreWeave → CoreWeave leases from Oracle → Oracle buys from NVIDIA. Capital is recycling within a closed circle. That makes the ecosystem look larger and more robust than it may actually be. Some portion of the $750bn capex figure is, in substance, the same dollar going around the loop. This is exactly how vendor-financing loops worked in the telecom bubble.
+
+**5. "You can look diversified and actually be running one trade."**
+A book holding hyperscaler bonds, semiconductor credit, data-centre ABS, neocloud TRS exposure and power-infrastructure repo looks diverse across names and sectors. In a drawdown, all of it moves together because it's all downstream of the same decision: hyperscaler capex guidance. This is the most underappreciated risk on the desk — issuer- and sector-level limits don't capture it. You need an explicit AI-capex factor that aggregates across the whole book.
+
+**6. "The desk is simultaneously long the AI build-out and potentially short AI disruption — and most people haven't netted those."**
+The build-out creates collateral and financing demand — good for revenue. But the same technology is disrupting software and SaaS businesses, which is where a decade of leveraged lending sat. Those loans were underwritten on stable recurring revenue assumptions that AI may impair. If you finance against that collateral too, you have positions on both sides of the same trade, in different silos, with no one netting them. That's the hidden risk.
+
+**7. "Wrong-way risk is the defining desk risk — not any individual credit."**
+In an AI drawdown, three bad things happen at the same time: collateral values fall, leveraged counterparties weaken, and the cost to fund AI collateral rises. All three legs of that move together. That's not a normal credit or market risk — it's a correlated, compounding loss mechanism. The 5x TRS client running into margin calls into falling, illiquid prices is exactly the scenario that has caused financing-desk losses historically. Stress-testing for this as a single correlated event, not three separate scenarios, is the right framework.
+
+**8. "The greatest risk is not companies failing to adopt AI — it's companies and investors who overbuild assuming perpetual growth."**
+This is the telecom lesson applied cleanly. The internet thesis was correct. Fibre was the future. And 85–95% of the fibre laid sat dark for years because demand couldn't absorb the capacity. AI will likely be transformative. The credit question is whether the capacity being financed today will be utilised at rates that justify the debt being issued to build it. Being right about the technology and wrong about the financing are entirely compatible.
+
+---
+
+Those eight points, backed by the numbers in the report, are things you can credibly present as your own analysis. The best ones for a conversation with senior people on the desk are **2, 5, 6 and 7** — they're the most original, most directly actionable for the desk's risk management, and hardest to find in generic AI commentary.
