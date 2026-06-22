@@ -1,0 +1,548 @@
+Option Explicit
+
+'==============================================================================
+'  WORD DOCUMENT GENERATOR  (Excel-driven, Word late-binding)
+'------------------------------------------------------------------------------
+'  PURPOSE
+'    Generate a Word document from a Word template by replacing <<Placeholder>>
+'    tokens with values taken from the "Main" worksheet.
+'
+'  WORKSHEET LAYOUT  (sheet must be named: Main)
+'    Row 1            : column headers (ignored)
+'    Column A (A2:..) : Placeholder Name   e.g.  Counterparty
+'    Column B (B2:..) : Placeholder Value  e.g.  Canadian Imperial Bank of Commerce
+'    Cell  D2         : full path of the selected Word template
+'
+'  TEMPLATE TOKEN FORMAT
+'    <<PlaceholderName>>   ->  built as  "<<" & A-cell & ">>"
+'
+'  HOW TO USE
+'    1.  Run  BrowseTemplate     -> pick a .docx/.docm/.dotx/.dotm template
+'    2.  Fill column B with the transaction values
+'    3.  Run  GenerateDocument   -> a finished copy opens in Word for review
+'
+'  NOTES
+'    * Word is driven via late binding  CreateObject("Word.Application").
+'      No reference to the Word object library is required.
+'    * The ORIGINAL template is opened READ-ONLY and is never modified.
+'    * The generated file is saved to the TEMP folder as
+'        GeneratedDocument_YYYYMMDD_HHMMSS.docx
+'    * Replacement is applied to body, tables, headers, footers (primary /
+'      first page / even pages), shapes, text boxes and linked story chains.
+'==============================================================================
+
+'--- Word / Excel enum values (defined locally so no references are needed) ---
+Private Const WD_FIND_CONTINUE As Long = 1      ' wdFindContinue
+Private Const WD_FIND_STOP     As Long = 0      ' wdFindStop
+Private Const WD_REPLACE_ALL   As Long = 2      ' wdReplaceAll
+Private Const WD_COLLAPSE_END  As Long = 0      ' wdCollapseEnd
+Private Const WD_FORMAT_DOCX   As Long = 12     ' wdFormatXMLDocument (.docx)
+Private Const WD_DO_NOT_SAVE   As Long = 0      ' wdDoNotSaveChanges
+Private Const WD_ALERTS_NONE   As Long = 0      ' wdAlertsNone
+Private Const MSO_GROUP        As Long = 6      ' msoGroup (grouped shapes)
+Private Const XL_UP            As Long = -4162  ' xlUp
+
+
+'==============================================================================
+'  PUBLIC PROCEDURE 1 : BrowseTemplate
+'  Lets the user pick a Word template and stores its path in Main!D2.
+'==============================================================================
+Public Sub BrowseTemplate()
+    On Error GoTo ErrHandler
+
+    Dim ws As Object
+    Set ws = GetMainSheet()
+    If ws Is Nothing Then
+        MsgBox "The worksheet named 'Main' could not be found." & vbCrLf & _
+               "Please make sure a sheet called 'Main' exists in this workbook.", _
+               vbExclamation, "Worksheet Missing"
+        Exit Sub
+    End If
+
+    ' Open the file picker, restricted to Word document/template types.
+    Dim ret As Variant
+    ret = Application.GetOpenFilename( _
+        FileFilter:="Word Templates (*.docx;*.docm;*.dotx;*.dotm)," & _
+                    "*.docx;*.docm;*.dotx;*.dotm", _
+        Title:="Select a Word Template", _
+        MultiSelect:=False)
+
+    ' GetOpenFilename returns Boolean False when cancelled, else a String path.
+    If TypeName(ret) = "Boolean" Then
+        MsgBox "Template selection was cancelled. No template was chosen.", _
+               vbInformation, "Selection Cancelled"
+        Exit Sub
+    End If
+
+    Dim templatePath As String
+    templatePath = CStr(ret)
+
+    ' Store the selected path in Main!D2.
+    ws.Range("D2").Value = templatePath
+
+    MsgBox "Template selected successfully:" & vbCrLf & vbCrLf & templatePath, _
+           vbInformation, "Template Selected"
+    Exit Sub
+
+ErrHandler:
+    MsgBox "An unexpected error occurred while selecting the template." & vbCrLf & vbCrLf & _
+           "Error " & Err.Number & ": " & Err.Description, _
+           vbCritical, "Browse Template Error"
+End Sub
+
+
+'==============================================================================
+'  PUBLIC PROCEDURE 2 : GenerateDocument
+'  Builds a finished Word document from the template and the placeholder table.
+'==============================================================================
+Public Sub GenerateDocument()
+
+    '--- Excel state we must always restore ---
+    Dim prevScreenUpdating As Boolean
+    prevScreenUpdating = Application.ScreenUpdating
+
+    '--- Late-bound Word objects ---
+    Dim wdApp As Object
+    Dim wdDoc As Object
+
+    '--- Flow control / diagnostics ---
+    Dim generatedOK     As Boolean
+    Dim createdWordHere As Boolean
+    Dim stage           As String
+
+    On Error GoTo ErrHandler
+    generatedOK = False
+    createdWordHere = False
+
+    '==========================================================================
+    ' STEP 1 - Locate the "Main" worksheet
+    '==========================================================================
+    stage = "reading the worksheet"
+    Dim ws As Object
+    Set ws = GetMainSheet()
+    If ws Is Nothing Then
+        MsgBox "The worksheet named 'Main' could not be found." & vbCrLf & _
+               "Please make sure a sheet called 'Main' exists in this workbook.", _
+               vbExclamation, "Worksheet Missing"
+        Exit Sub
+    End If
+
+    '==========================================================================
+    ' STEP 2 - Read and validate the template path (Main!D2)
+    '==========================================================================
+    stage = "validating the template path"
+    Dim templatePath As String
+    templatePath = Trim(ws.Range("D2").Value & "")   ' "& """"" coerces blanks safely
+
+    If Len(templatePath) = 0 Then
+        MsgBox "No template has been selected." & vbCrLf & vbCrLf & _
+               "Please click 'Browse Template' first and choose a Word template.", _
+               vbExclamation, "Template Path Missing"
+        Exit Sub
+    End If
+
+    If Not FileExists(templatePath) Then
+        MsgBox "The selected template file could not be found:" & vbCrLf & vbCrLf & _
+               templatePath & vbCrLf & vbCrLf & _
+               "It may have been moved, renamed or deleted. " & _
+               "Please select the template again.", _
+               vbExclamation, "Template Not Found"
+        Exit Sub
+    End If
+
+    '==========================================================================
+    ' STEP 3 - Read placeholder definitions from columns A (name) and B (value)
+    '          Dynamically determine the last populated row.
+    '==========================================================================
+    stage = "reading placeholder definitions"
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(XL_UP).Row
+
+    ' Data starts on row 2 (row 1 holds the column headers).
+    If lastRow < 2 Then
+        MsgBox "No placeholders were found." & vbCrLf & vbCrLf & _
+               "Please enter placeholder names in column A and their values in " & _
+               "column B (starting on row 2).", _
+               vbExclamation, "No Placeholders"
+        Exit Sub
+    End If
+
+    ' Load placeholders into arrays so Word is touched as little as possible.
+    Dim phNames()  As String
+    Dim phValues() As String
+    ReDim phNames(1 To lastRow)
+    ReDim phValues(1 To lastRow)
+
+    Dim r  As Long
+    Dim n  As Long
+    Dim nm As String
+    Dim vl As String
+    n = 0
+    For r = 2 To lastRow
+        nm = Trim(ws.Cells(r, 1).Value & "")    ' placeholder name
+        vl = ws.Cells(r, 2).Value & ""          ' value (kept exactly as entered)
+        ' Skip empty rows / rows whose placeholder name is blank.
+        If Len(nm) > 0 Then
+            n = n + 1
+            phNames(n) = "<<" & nm & ">>"
+            phValues(n) = vl
+        End If
+    Next r
+
+    If n = 0 Then
+        MsgBox "No valid placeholders were found." & vbCrLf & vbCrLf & _
+               "Every row in column A appears to be blank. " & _
+               "Please enter at least one placeholder name.", _
+               vbExclamation, "No Placeholders"
+        Exit Sub
+    End If
+
+    ' We are about to drive Word - reduce Excel UI overhead.
+    Application.ScreenUpdating = False
+    On Error Resume Next
+    Application.StatusBar = "Generating document, please wait..."
+    On Error GoTo ErrHandler
+
+    '==========================================================================
+    ' STEP 4 - Start Microsoft Word (LATE BINDING ONLY)
+    '==========================================================================
+    stage = "starting Microsoft Word"
+    Set wdApp = CreateObject("Word.Application")     ' raises 429 if Word missing
+    If wdApp Is Nothing Then
+        Err.Raise vbObjectError + 1001, , "Microsoft Word could not be started."
+    End If
+    createdWordHere = True
+    wdApp.Visible = False                            ' work hidden (fast, no flicker)
+    On Error Resume Next
+    wdApp.DisplayAlerts = WD_ALERTS_NONE             ' suppress Word prompts
+    On Error GoTo ErrHandler
+
+    '==========================================================================
+    ' STEP 5 - Open the template READ-ONLY (the original is never modified)
+    '==========================================================================
+    stage = "opening the template"
+    Set wdDoc = wdApp.Documents.Open( _
+        FileName:=templatePath, _
+        ReadOnly:=True, _
+        AddToRecentFiles:=False, _
+        Visible:=False)
+
+    If wdDoc Is Nothing Then
+        Err.Raise vbObjectError + 1002, , "The template could not be opened."
+    End If
+
+    '==========================================================================
+    ' STEP 6 - Replace every placeholder, everywhere, in memory
+    '          (the document is read-only on disk, so the original is safe)
+    '==========================================================================
+    stage = "replacing placeholders"
+    Dim i As Long
+    For i = 1 To n
+        ReplaceEverywhere wdDoc, phNames(i), phValues(i)
+    Next i
+
+    '==========================================================================
+    ' STEP 7 - Save the finished copy to a unique TEMP path
+    '==========================================================================
+    stage = "saving the generated document"
+    Dim outPath As String
+    outPath = BuildOutputPath()
+    SaveDocAs wdDoc, outPath          ' SaveAs2 -> falls back to SaveAs on old Word
+
+    generatedOK = True                ' past this point we keep Word open for review
+
+    '==========================================================================
+    ' STEP 8 - Show Word and bring the document to the foreground
+    '          (cosmetic only - errors here must NOT trigger cleanup)
+    '==========================================================================
+    On Error Resume Next
+    wdApp.Visible = True
+    wdApp.Activate
+    wdDoc.Activate
+    AppActivate wdApp.Caption
+    On Error GoTo 0
+
+    ' Restore the Excel environment before talking to the user.
+    Application.ScreenUpdating = prevScreenUpdating
+    On Error Resume Next
+    Application.StatusBar = False
+    On Error GoTo 0
+
+    MsgBox "Document generated successfully." & vbCrLf & vbCrLf & _
+           "Placeholders applied : " & n & vbCrLf & _
+           "Saved to:" & vbCrLf & outPath & vbCrLf & vbCrLf & _
+           "The document is now open in Microsoft Word for your review.", _
+           vbInformation, "Success"
+
+    ' Release our references. Word stays open because it is visible and
+    ' still holds the generated document.
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    Exit Sub
+
+'==============================================================================
+'  ERROR HANDLER
+'==============================================================================
+ErrHandler:
+    Dim errNum  As Long
+    Dim errDesc As String
+    errNum = Err.Number
+    errDesc = Err.Description
+
+    ' If generation did not complete, tidy up Word so we never leave an
+    ' orphaned hidden WINWORD.EXE process running in the background.
+    If Not generatedOK Then
+        On Error Resume Next
+        If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=WD_DO_NOT_SAVE
+        If createdWordHere And Not wdApp Is Nothing Then wdApp.Quit SaveChanges:=WD_DO_NOT_SAVE
+        On Error GoTo 0
+    End If
+
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+
+    ' Always restore the Excel environment.
+    On Error Resume Next
+    Application.ScreenUpdating = prevScreenUpdating
+    Application.StatusBar = False
+    On Error GoTo 0
+
+    ' Build a clear, context-aware message.
+    Dim msg As String
+    msg = "The document could not be generated." & vbCrLf & vbCrLf
+    If Len(stage) > 0 Then msg = msg & "Stage : " & stage & vbCrLf
+    msg = msg & "Error " & errNum & " : " & errDesc & vbCrLf & vbCrLf
+
+    Select Case errNum
+        Case 429
+            msg = msg & "Microsoft Word does not appear to be installed or registered " & _
+                  "on this PC. Please install Microsoft Word and try again."
+        Case 70
+            msg = msg & "Permission was denied. The file may be open, read-only, or in " & _
+                  "a protected folder. Close the file if it is open and try again."
+        Case 75, 76
+            msg = msg & "The output location could not be reached. Please check that the " & _
+                  "TEMP folder is accessible."
+        Case 5, 438, 462
+            msg = msg & "Microsoft Word reported a problem while processing the document. " & _
+                  "Please make sure Word is installed and working, then try again."
+        Case Else
+            msg = msg & "Please review the details above and try again."
+    End Select
+
+    MsgBox msg, vbCritical, "Generation Failed"
+End Sub
+
+
+'==============================================================================
+'  PRIVATE HELPER : GetMainSheet
+'  Returns the "Main" worksheet, or Nothing if it does not exist.
+'==============================================================================
+Private Function GetMainSheet() As Object
+    On Error Resume Next
+    Set GetMainSheet = ThisWorkbook.Worksheets("Main")
+    On Error GoTo 0
+End Function
+
+
+'==============================================================================
+'  PRIVATE HELPER : FileExists
+'  True if a file exists at the given full path.
+'==============================================================================
+Private Function FileExists(ByVal path As String) As Boolean
+    On Error Resume Next
+    FileExists = (Len(Dir(path, vbNormal)) > 0)
+    On Error GoTo 0
+End Function
+
+
+'==============================================================================
+'  PRIVATE HELPER : BuildOutputPath
+'  Returns a unique TEMP path:  GeneratedDocument_YYYYMMDD_HHMMSS.docx
+'==============================================================================
+Private Function BuildOutputPath() As String
+    Dim baseFolder As String
+    Dim fileStem   As String
+    Dim candidate  As String
+    Dim counter    As Long
+
+    baseFolder = Environ$("TEMP")
+    If Len(baseFolder) = 0 Then baseFolder = Environ$("TMP")
+    If Len(baseFolder) = 0 Then baseFolder = CurDir$           ' last-resort fallback
+    If Right$(baseFolder, 1) = "\" Then baseFolder = Left$(baseFolder, Len(baseFolder) - 1)
+
+    ' "n" = minutes (avoids the month/minute ambiguity of "m").
+    fileStem = "GeneratedDocument_" & Format$(Now, "yyyymmdd_hhnnss")
+    candidate = baseFolder & "\" & fileStem & ".docx"
+
+    ' Guarantee uniqueness even if two runs land within the same second.
+    counter = 1
+    Do While FileExists(candidate)
+        counter = counter + 1
+        candidate = baseFolder & "\" & fileStem & "_" & counter & ".docx"
+    Loop
+
+    BuildOutputPath = candidate
+End Function
+
+
+'==============================================================================
+'  PRIVATE HELPER : SaveDocAs
+'  Saves the document as .docx. Uses SaveAs2 (Word 2010+) and falls back to
+'  SaveAs on older versions. A genuine save failure propagates to the caller.
+'==============================================================================
+Private Sub SaveDocAs(ByVal doc As Object, ByVal outPath As String)
+    On Error GoTo UseSaveAs
+    doc.SaveAs2 FileName:=outPath, FileFormat:=WD_FORMAT_DOCX
+    Exit Sub
+UseSaveAs:
+    ' SaveAs2 is unavailable (older Word) - use the classic SaveAs.
+    ' Any error from this line is real and bubbles up to GenerateDocument.
+    doc.SaveAs FileName:=outPath, FileFormat:=WD_FORMAT_DOCX
+End Sub
+
+
+'==============================================================================
+'  PRIVATE HELPER : ReplaceEverywhere
+'  Replaces one placeholder with one value across EVERY part of the document:
+'  body, tables, footnotes/endnotes/comments, all headers & footers (primary /
+'  first page / even pages) of every section, shapes, text boxes and linked
+'  story chains. Replacement is best-effort: a single awkward range can never
+'  abort the whole run.
+'==============================================================================
+Private Sub ReplaceEverywhere(ByVal doc As Object, ByVal findText As String, _
+                              ByVal replaceText As String)
+    If doc Is Nothing Then Exit Sub
+    On Error Resume Next   ' best-effort: skip any range that misbehaves
+
+    Dim rngStory As Object
+    Dim curRange As Object
+    Dim nxt      As Object
+    Dim safety   As Long
+
+    ' 1) Every story range, following linked text-frame chains.
+    For Each rngStory In doc.StoryRanges
+        Set curRange = rngStory
+        safety = 0
+        Do While Not curRange Is Nothing
+            ReplaceInStoryRange curRange, findText, replaceText
+            ' Shapes / text boxes anchored within this story range.
+            ReplaceInShapes curRange.ShapeRange, findText, replaceText
+            ' Advance along the linked story chain (text boxes link this way).
+            Set nxt = Nothing
+            Set nxt = curRange.NextStoryRange      ' on error -> nxt stays Nothing
+            Set curRange = nxt
+            safety = safety + 1
+            If safety > 50000 Then Exit Do         ' guard against pathological chains
+        Loop
+    Next rngStory
+
+    ' 2) Floating shapes / text boxes anchored in the document body.
+    ReplaceInShapes doc.Shapes, findText, replaceText
+
+    ' 3) Headers & footers for EVERY section and EVERY type, plus their shapes.
+    '    1 = Primary, 2 = First Page, 3 = Even Pages.
+    Dim sec     As Object
+    Dim hdrftr  As Object
+    Dim k       As Long
+    For Each sec In doc.Sections
+        For k = 1 To 3
+            Set hdrftr = sec.Headers(k)
+            ReplaceInStoryRange hdrftr.Range, findText, replaceText
+            ReplaceInShapes hdrftr.Shapes, findText, replaceText
+
+            Set hdrftr = sec.Footers(k)
+            ReplaceInStoryRange hdrftr.Range, findText, replaceText
+            ReplaceInShapes hdrftr.Shapes, findText, replaceText
+        Next k
+    Next sec
+End Sub
+
+
+'==============================================================================
+'  PRIVATE HELPER : ReplaceInStoryRange
+'  Replaces all occurrences of findText with replaceText inside one range,
+'  using Word Find/Replace with exact, non-wildcard matching.
+'    * Fast path : Find/Replace All (values up to 255 chars, no "^" code char).
+'    * Safe path : literal text insertion for long values or values that
+'                  contain "^" (which Word would otherwise treat as a code).
+'==============================================================================
+Private Sub ReplaceInStoryRange(ByVal rng As Object, ByVal findText As String, _
+                                ByVal replaceText As String)
+    If rng Is Nothing Then Exit Sub
+    On Error Resume Next   ' protected / empty ranges must never abort the run
+
+    If Len(replaceText) <= 255 And InStr(replaceText, "^") = 0 Then
+        '--- Fast path: replace every occurrence in one call ---
+        With rng.Find
+            .ClearFormatting
+            .Replacement.ClearFormatting
+            .Text = findText
+            .Replacement.Text = replaceText
+            .Forward = True
+            .Wrap = WD_FIND_CONTINUE
+            .Format = False
+            .MatchCase = True            ' exact, case-sensitive token match
+            .MatchWholeWord = False      ' "<<X>>" is not a "whole word"
+            .MatchWildcards = False      ' literal text, no wildcards
+            .MatchSoundsLike = False
+            .MatchAllWordForms = False
+            .Execute Replace:=WD_REPLACE_ALL
+        End With
+    Else
+        '--- Safe path: find, then set the found range's text literally ---
+        Dim searchRange As Object
+        Dim guard       As Long
+        Set searchRange = rng.Duplicate
+        With searchRange.Find
+            .ClearFormatting
+            .Replacement.ClearFormatting
+            .Text = findText
+            .Forward = True
+            .Wrap = WD_FIND_STOP         ' walk forward once through the story
+            .Format = False
+            .MatchCase = True
+            .MatchWholeWord = False
+            .MatchWildcards = False
+            .MatchSoundsLike = False
+            .MatchAllWordForms = False
+        End With
+        guard = 0
+        Do While searchRange.Find.Execute
+            searchRange.Text = replaceText          ' literal: no 255 limit, no codes
+            searchRange.Collapse WD_COLLAPSE_END    ' move past the inserted text
+            searchRange.End = rng.End               ' re-extend to end of the story
+            guard = guard + 1
+            If guard > 100000 Then Exit Do          ' absolute runaway-loop safety
+        Loop
+    End If
+
+    On Error GoTo 0
+End Sub
+
+
+'==============================================================================
+'  PRIVATE HELPER : ReplaceInShapes
+'  Replaces placeholders inside a collection of shapes, recursing into grouped
+'  shapes. Shapes without text are skipped automatically.
+'==============================================================================
+Private Sub ReplaceInShapes(ByVal shps As Object, ByVal findText As String, _
+                            ByVal replaceText As String)
+    If shps Is Nothing Then Exit Sub
+    Dim shp As Object
+    On Error Resume Next
+    For Each shp In shps
+        If Not shp Is Nothing Then
+            If shp.Type = MSO_GROUP Then
+                ' Grouped shape: recurse into its members.
+                ReplaceInShapes shp.GroupItems, findText, replaceText
+            Else
+                ' Only shapes that actually contain text expose a usable TextFrame.
+                If shp.TextFrame.HasText Then
+                    ReplaceInStoryRange shp.TextFrame.TextRange, findText, replaceText
+                End If
+            End If
+        End If
+    Next shp
+    On Error GoTo 0
+End Sub
