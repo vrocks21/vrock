@@ -1,0 +1,44 @@
+Your code from the previous message is already the copy-paste version — paste it exactly as-is, no edits needed. Here's the full setup and run process.
+
+## 1. Build the workbook
+1. Open Excel and **Save As → `.xlsm`** (Excel Macro-Enabled Workbook). A normal `.xlsx` will delete the macros on save.
+2. Rename a sheet to **Main**.
+3. Set up the layout:
+
+| Cell | Content |
+|------|---------|
+| A1 | `Placeholder Name` |
+| B1 | `Placeholder Value` |
+| D1 | `Template Path` |
+| A2↓ | your placeholder names (e.g. `Counterparty`) |
+| B2↓ | the matching values |
+| D2 | leave blank — filled automatically |
+
+Row 1 is headers; the code reads data from row 2 down.
+
+## 2. Paste the code
+1. Press **Alt + F11** (opens the VBA editor).
+2. **Insert → Module**.
+3. Paste the entire code block from my previous message.
+4. Close the editor (**Alt + Q**).
+
+## 3. Add two buttons (optional)
+If you don't see the **Developer** tab: File → Options → Customize Ribbon → tick **Developer**.
+
+Then Developer → Insert → **Button (Form Control)**, draw it, and assign:
+- Button 1 → `BrowseTemplate`
+- Button 2 → `GenerateDocument`
+
+(Or skip buttons and run via **Alt + F8** → pick the macro → Run.)
+
+## 4. Run it
+1. Click **Browse Template** → select your `.docx`/`.docm`/`.dotx`/`.dotm`. Path lands in D2.
+2. Fill column B with your values.
+3. Click **Generate Document** → the finished copy opens in Word.
+
+## One thing that must match
+The tokens inside your Word template must be written exactly as `<<Name>>`, where `Name` is identical to column A. So A2 = `Counterparty` → template must contain `<<Counterparty>>`. Spelling and case must match.
+
+If macros are blocked when you reopen the file, click **Enable Content** on the yellow security bar.
+
+Want me to package this as a ready-made `.xlsm` with the sheet and buttons already set up so you just add your template?
