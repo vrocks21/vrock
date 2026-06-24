@@ -1,0 +1,445 @@
+Attribute VB_Name = "modWordGen"
+'=================================================================
+' modWordGen
+' The document generation engine. Everything here is LATE BOUND.
+'
+' Pipeline (order matters):
+'   1. Copy the template to a working file in TEMP (original untouched).
+'   2. Open the working copy invisibly.
+'   3. Process ALT sections   (keep one option, delete the rest).
+'   4. Replace all placeholders everywhere.
+'   5. Clean up excessive blank paragraphs.
+'   6. Scan for any unresolved <<...>> tags.
+'   7. SaveAs the output .docx, delete the working copy, show Word.
+'=================================================================
+Option Explicit
+
+'--- Late-binding numeric constants (no Word reference available) ---
+Private Const wdDoNotSaveChanges As Long = 0
+Private Const wdFindStop         As Long = 0
+Private Const wdCollapseEnd      As Long = 0
+Private Const wdFormatXMLDocument As Long = 12
+Private Const wdReplaceAll       As Long = 2
+Private Const wdAlertsNone       As Long = 0
+
+'-----------------------------------------------------------------
+' Main entry. Returns True on success. Fills 'unresolved' with any
+' placeholder tags still present after processing.
+'-----------------------------------------------------------------
+Public Function BuildWordDocument(ByVal templatePath As String, _
+                                  ByVal data As Object, _
+                                  ByVal altSel As Object, _
+                                  ByVal outputPath As String, _
+                                  ByRef unresolved As Collection) As Boolean
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Dim workingCopy As String
+
+    BuildWordDocument = False
+    Set unresolved = New Collection
+
+    If Not FileExists(templatePath) Then
+        Err.Raise ERR_BASE + 1201, "BuildWordDocument", _
+            "Template not found:" & vbCrLf & templatePath
+    End If
+
+    '--- Make a private working copy so the original is never opened
+    '    for edit.
+    Randomize
+    workingCopy = TempFolderPath() & "\VZ_work_" & _
+                  Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+                  CStr(Int(Rnd * 100000)) & ".docx"
+
+    On Error GoTo CleanFail
+    SafeKill workingCopy
+    FileCopy templatePath, workingCopy
+
+    Set wdApp = NewWordApp()
+    wdApp.Visible = False
+    On Error Resume Next
+    wdApp.DisplayAlerts = wdAlertsNone
+    On Error GoTo CleanFail
+
+    Set wdDoc = wdApp.Documents.Open(FileName:=workingCopy, _
+                                     ReadOnly:=False, _
+                                     AddToRecentFiles:=False, _
+                                     Visible:=False)
+
+    '--- 3) ALT first, so kept blocks still get placeholder replacement
+    '       and deleted blocks contribute nothing to the unresolved scan.
+    ProcessAltSections wdDoc, altSel
+
+    '--- 4) Replace every placeholder across every story range.
+    ReplaceAllPlaceholders wdDoc, data
+
+    '--- 5) Tidy whitespace left behind by deleted blocks.
+    CleanupBlankParagraphs wdDoc
+
+    '--- 6) Report anything still unresolved.
+    ScanUnresolved wdDoc, unresolved
+
+    '--- 7) Save final output, drop the working copy, reveal Word.
+    SafeKill outputPath
+    wdDoc.SaveAs2 FileName:=outputPath, FileFormat:=wdFormatXMLDocument
+    ' wdDoc now points at outputPath, so the working copy is free.
+    SafeKill workingCopy
+
+    wdApp.Visible = True
+    On Error Resume Next
+    wdApp.Activate
+    wdDoc.Activate
+    AppActivate wdApp.Caption
+    On Error GoTo 0
+
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    BuildWordDocument = True
+    Exit Function
+
+CleanFail:
+    Dim em As String
+    em = Err.Description
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close wdDoNotSaveChanges
+    If Not wdApp Is Nothing Then wdApp.Quit
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    SafeKill workingCopy
+    On Error GoTo 0
+    Err.Raise ERR_BASE + 1209, "BuildWordDocument", em
+End Function
+
+'-----------------------------------------------------------------
+' Processes ALT sections against the user's selections (read from the
+' wAlt working sheet). For each option key:
+'   - if its section's selection matches this option's label -> KEEP
+'     (strip the START and END markers, keep the content between),
+'   - otherwise -> DELETE the whole block including its markers.
+' A selection of "None" (or a section with no matching option) deletes
+' every block for that section.
+'-----------------------------------------------------------------
+Public Sub ProcessAltSections(ByVal wdDoc As Object, ByVal altSel As Object)
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim secName As String, optLabel As String, fullKey As String
+    Dim chosen As String
+    Dim startTag As String, endTag As String
+
+    If Not SheetExists(SHEET_ALT) Then Exit Sub
+    Set ws = ThisWorkbook.Worksheets(SHEET_ALT)
+    lastRow = LastRowIn(ws, 1, 2)
+
+    For r = 2 To lastRow
+        secName = Trim$(CStr(ws.Cells(r, 1).Value))
+        optLabel = Trim$(CStr(ws.Cells(r, 2).Value))
+        fullKey = Trim$(CStr(ws.Cells(r, 3).Value))
+        If Len(fullKey) = 0 Then GoTo NextRow
+
+        If altSel.Exists(secName) Then
+            chosen = CStr(altSel.Item(secName))
+        Else
+            chosen = ALT_NONE
+        End If
+
+        startTag = "<<ALT_" & fullKey & "_START>>"
+        endTag = "<<ALT_" & fullKey & "_END>>"
+
+        If StrComp(chosen, ALT_NONE, vbTextCompare) <> 0 _
+           And StrComp(chosen, optLabel, vbTextCompare) = 0 Then
+            ' KEEP this block: remove only the two markers.
+            RemoveMarkersEverywhere wdDoc, startTag, endTag
+        Else
+            ' DELETE this block, markers and content.
+            DeleteBlockEverywhere wdDoc, startTag, endTag
+        End If
+NextRow:
+    Next r
+End Sub
+
+'-----------------------------------------------------------------
+' Removes a START and an END marker (keeping the text between them)
+' from every story range in the document.
+'-----------------------------------------------------------------
+Private Sub RemoveMarkersEverywhere(ByVal wdDoc As Object, _
+                                    ByVal startTag As String, _
+                                    ByVal endTag As String)
+    Dim ranges As Collection, i As Long, rng As Object
+    Set ranges = GetProcessRanges(wdDoc)
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        ReplaceTextInRange rng, startTag, ""
+        ReplaceTextInRange rng, endTag, ""
+    Next i
+End Sub
+
+'-----------------------------------------------------------------
+' Deletes the entire span from a START marker to its END marker
+' (inclusive) from every story range in the document.
+'-----------------------------------------------------------------
+Private Sub DeleteBlockEverywhere(ByVal wdDoc As Object, _
+                                  ByVal startTag As String, _
+                                  ByVal endTag As String)
+    Dim ranges As Collection, i As Long, rng As Object
+    Set ranges = GetProcessRanges(wdDoc)
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        DeleteBetweenTagsInRange rng, startTag, endTag
+    Next i
+End Sub
+
+'-----------------------------------------------------------------
+' Within a single range, repeatedly finds startTag, then endTag after
+' it, and deletes everything from the start of startTag to the end of
+' endTag. Stops if a START has no following END (and warns once via
+' the caller's validation; here we just stop to stay safe).
+'-----------------------------------------------------------------
+Private Sub DeleteBetweenTagsInRange(ByVal rng As Object, _
+                                     ByVal startTag As String, _
+                                     ByVal endTag As String)
+    Dim docObj As Object
+    Dim fStart As Object, fEnd As Object
+    Dim guard As Long
+
+    Set docObj = rng.Document
+
+    Do
+        guard = guard + 1
+        If guard > 500 Then Exit Do
+
+        '--- Find the START marker within the range.
+        Set fStart = rng.Duplicate
+        fStart.Find.ClearFormatting
+        With fStart.Find
+            .Text = startTag
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchCase = True
+            .MatchWildcards = False
+            .Format = False
+        End With
+        If Not fStart.Find.Execute Then Exit Do
+
+        '--- Find the END marker after the START.
+        Set fEnd = docObj.Range(fStart.End, rng.End)
+        fEnd.Find.ClearFormatting
+        With fEnd.Find
+            .Text = endTag
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchCase = True
+            .MatchWildcards = False
+            .Format = False
+        End With
+        If Not fEnd.Find.Execute Then Exit Do   ' missing END: stop safely
+
+        '--- Delete the whole span, markers included.
+        Dim span As Object
+        Set span = docObj.Range(fStart.Start, fEnd.End)
+        span.Delete
+    Loop
+End Sub
+
+'-----------------------------------------------------------------
+' Replaces every placeholder (from the wPlaceholders working sheet)
+' with its value (from the data dictionary) across every story range.
+' Placeholders with no supplied value become empty string.
+'-----------------------------------------------------------------
+Public Sub ReplaceAllPlaceholders(ByVal wdDoc As Object, ByVal data As Object)
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim nm As String, val As String
+    Dim ranges As Collection, i As Long, rng As Object
+
+    If Not SheetExists(SHEET_PLACEHLDR) Then Exit Sub
+    Set ws = ThisWorkbook.Worksheets(SHEET_PLACEHLDR)
+    lastRow = LastRowIn(ws, 1, 2)
+
+    Set ranges = GetProcessRanges(wdDoc)
+
+    For r = 2 To lastRow
+        nm = Trim$(CStr(ws.Cells(r, 1).Value))
+        If Len(nm) > 0 Then
+            If data.Exists(nm) Then
+                val = CStr(data.Item(nm))
+            Else
+                val = ""
+            End If
+            For i = 1 To ranges.Count
+                Set rng = ranges.Item(i)
+                ReplaceTextInRange rng, "<<" & nm & ">>", val
+            Next i
+        End If
+    Next r
+End Sub
+
+'-----------------------------------------------------------------
+' Core replace primitive. Replaces every occurrence of findText with
+' replaceText inside a single range, with NO 255-character limit on
+' the replacement (we set Range.Text directly rather than using
+' Find.Replacement.Text). Collapsing past the inserted text after
+' each hit prevents infinite loops when the replacement itself
+' contains the search text.
+'-----------------------------------------------------------------
+Public Sub ReplaceTextInRange(ByVal rng As Object, _
+                              ByVal findText As String, _
+                              ByVal replaceText As String)
+    Dim docObj As Object
+    Dim found As Object
+    Dim guard As Long
+
+    If Len(findText) = 0 Then Exit Sub
+    Set docObj = rng.Document
+
+    Set found = rng.Duplicate
+    found.Find.ClearFormatting
+    With found.Find
+        .Text = findText
+        .Forward = True
+        .Wrap = wdFindStop
+        .MatchCase = True
+        .MatchWildcards = False
+        .Format = False
+    End With
+
+    Do While found.Find.Execute
+        guard = guard + 1
+        If guard > 5000 Then Exit Do
+
+        ' Replace the found text by writing directly to the range.
+        found.Text = replaceText
+        ' Move past what we just inserted so we never re-match it.
+        found.Collapse wdCollapseEnd
+        found.End = rng.End
+
+        found.Find.ClearFormatting
+        With found.Find
+            .Text = findText
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchCase = True
+            .MatchWildcards = False
+            .Format = False
+        End With
+    Loop
+End Sub
+
+'-----------------------------------------------------------------
+' Builds a collection of EVERY range we must process: all story
+' ranges (with their NextStoryRange chains), body shapes, and each
+' section's three header and three footer variants plus shapes inside
+' them. Double coverage is harmless and idempotent.
+'-----------------------------------------------------------------
+Public Function GetProcessRanges(ByVal wdDoc As Object) As Collection
+    Dim col As New Collection
+    Dim story As Object, st As Object
+    Dim shp As Object, sec As Object
+    Dim hf As Object, idx As Long
+
+    '--- Story ranges and their continuation chains.
+    On Error Resume Next
+    For Each story In wdDoc.StoryRanges
+        Set st = story
+        Do While Not st Is Nothing
+            col.Add st
+            Set st = st.NextStoryRange
+        Loop
+    Next story
+    On Error GoTo 0
+
+    '--- Body shapes with text.
+    On Error Resume Next
+    For Each shp In wdDoc.Shapes
+        If shp.TextFrame.HasText Then
+            col.Add shp.TextFrame.TextRange
+        End If
+    Next shp
+    On Error GoTo 0
+
+    '--- Header/footer ranges (primary/first/even) and their shapes.
+    On Error Resume Next
+    For Each sec In wdDoc.Sections
+        For idx = 1 To 3
+            Set hf = sec.Headers.Item(idx)
+            If Not hf Is Nothing Then
+                If hf.Exists Then
+                    col.Add hf.Range
+                    For Each shp In hf.Shapes
+                        If shp.TextFrame.HasText Then col.Add shp.TextFrame.TextRange
+                    Next shp
+                End If
+            End If
+            Set hf = sec.Footers.Item(idx)
+            If Not hf Is Nothing Then
+                If hf.Exists Then
+                    col.Add hf.Range
+                    For Each shp In hf.Shapes
+                        If shp.TextFrame.HasText Then col.Add shp.TextFrame.TextRange
+                    Next shp
+                End If
+            End If
+        Next idx
+    Next sec
+    On Error GoTo 0
+
+    Set GetProcessRanges = col
+End Function
+
+'-----------------------------------------------------------------
+' Collapses runs of two or more consecutive empty paragraphs into a
+' single paragraph break, across every range. Heuristic (uses the
+' wildcard ^13{2,}), and fully guarded so it can never abort a run.
+'-----------------------------------------------------------------
+Public Sub CleanupBlankParagraphs(ByVal wdDoc As Object)
+    Dim ranges As Collection, i As Long, rng As Object
+    Set ranges = GetProcessRanges(wdDoc)
+
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        On Error Resume Next
+        With rng.Find
+            .ClearFormatting
+            .Replacement.ClearFormatting
+            .Text = "^13{2,}"
+            .Replacement.Text = "^p"
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchWildcards = True
+            .Execute Replace:=wdReplaceAll
+        End With
+        On Error GoTo 0
+    Next i
+End Sub
+
+'-----------------------------------------------------------------
+' Scans every range for any remaining <<...>> tags and adds the
+' deduped inner names to the 'unresolved' collection.
+'-----------------------------------------------------------------
+Public Sub ScanUnresolved(ByVal wdDoc As Object, ByRef unresolved As Collection)
+    Dim ranges As Collection, i As Long, rng As Object
+    Dim re As Object, matches As Object, m As Object
+    Dim seen As Object, inner As String
+
+    Set unresolved = New Collection
+    Set seen = NewDict()
+
+    Set re = NewRegExp()
+    re.Global = True
+    re.IgnoreCase = False
+    re.MultiLine = True
+    re.Pattern = "<<([^<>]+?)>>"
+
+    Set ranges = GetProcessRanges(wdDoc)
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        Set matches = re.Execute(rng.Text)
+        For Each m In matches
+            inner = Trim$(m.SubMatches(0))
+            If Len(inner) > 0 Then
+                If Not seen.Exists(inner) Then
+                    seen.Add inner, True
+                    unresolved.Add inner
+                End If
+            End If
+        Next m
+    Next i
+End Sub
