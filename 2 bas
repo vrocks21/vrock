@@ -1,0 +1,175 @@
+Attribute VB_Name = "modUtils"
+'=================================================================
+' modUtils
+' Low-level, dependency-free helpers shared across the project.
+'
+' All access to Word and the Scripting runtime is LATE BOUND here.
+' No project references are required for any of this to compile.
+'=================================================================
+Option Explicit
+
+' Custom error base. Anything we Raise uses vbObjectError + offset
+' so the numbers never collide with native VBA/Office error codes.
+Public Const ERR_BASE As Long = vbObjectError + 1500
+
+'-----------------------------------------------------------------
+' Late-bound Scripting.Dictionary factory.
+' Used everywhere instead of a referenced Scripting.Dictionary so
+' the workbook carries no library reference.
+'-----------------------------------------------------------------
+Public Function NewDict() As Object
+    Set NewDict = CreateObject("Scripting.Dictionary")
+End Function
+
+'-----------------------------------------------------------------
+' Late-bound VBScript RegExp factory.
+'-----------------------------------------------------------------
+Public Function NewRegExp() As Object
+    Set NewRegExp = CreateObject("VBScript.RegExp")
+End Function
+
+'-----------------------------------------------------------------
+' Late-bound Word.Application factory.
+' Raises a clean, described error if Word is not installed so the
+' caller can show a friendly message instead of an automation crash.
+'-----------------------------------------------------------------
+Public Function NewWordApp() As Object
+    On Error GoTo NoWord
+    Set NewWordApp = CreateObject("Word.Application")
+    Exit Function
+NoWord:
+    Err.Raise ERR_BASE + 1, "NewWordApp", _
+        "Microsoft Word could not be started. Word must be installed " & _
+        "on this machine to load templates and generate documents."
+End Function
+
+'-----------------------------------------------------------------
+' Returns True if a worksheet with the given name exists in ThisWorkbook.
+'-----------------------------------------------------------------
+Public Function SheetExists(ByVal sheetName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    SheetExists = Not ws Is Nothing
+End Function
+
+'-----------------------------------------------------------------
+' Ensures a worksheet with the given name exists and returns it.
+' Creates it if missing. makeVisible controls whether the sheet is
+' shown to the user or kept as a very-hidden working sheet.
+'-----------------------------------------------------------------
+Public Function EnsureSheet(ByVal sheetName As String, _
+                            ByVal makeVisible As Boolean) As Worksheet
+    Dim ws As Worksheet
+    If SheetExists(sheetName) Then
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+    Else
+        Set ws = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sheetName
+    End If
+
+    On Error Resume Next
+    If makeVisible Then
+        ws.Visible = xlSheetVisible
+    Else
+        ws.Visible = xlSheetVeryHidden
+    End If
+    On Error GoTo 0
+
+    Set EnsureSheet = ws
+End Function
+
+'-----------------------------------------------------------------
+' Path of the user's temp folder, no trailing separator.
+'-----------------------------------------------------------------
+Public Function TempFolderPath() As String
+    Dim p As String
+    p = Environ$("TEMP")
+    If Len(p) = 0 Then p = Environ$("TMP")
+    If Len(p) = 0 Then p = ThisWorkbook.Path
+    If Right$(p, 1) = "\" Then p = Left$(p, Len(p) - 1)
+    TempFolderPath = p
+End Function
+
+'-----------------------------------------------------------------
+' Deletes a file if it exists, swallowing any error (e.g. locked).
+'-----------------------------------------------------------------
+Public Sub SafeKill(ByVal filePath As String)
+    On Error Resume Next
+    If Len(Dir$(filePath)) > 0 Then Kill filePath
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' True if a file exists at the given path.
+'-----------------------------------------------------------------
+Public Function FileExists(ByVal filePath As String) As Boolean
+    On Error Resume Next
+    FileExists = (Len(filePath) > 0) And (Len(Dir$(filePath)) > 0)
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------
+' Joins a VBA.Collection of strings with the given separator.
+'-----------------------------------------------------------------
+Public Function CollectionToText(ByVal col As Collection, _
+                                 ByVal sep As String) As String
+    Dim i As Long, s As String
+    If col Is Nothing Then Exit Function
+    For i = 1 To col.Count
+        If i > 1 Then s = s & sep
+        s = s & CStr(col.Item(i))
+    Next i
+    CollectionToText = s
+End Function
+
+'-----------------------------------------------------------------
+' Last used row in a single column, scanning downward from startRow
+' and stopping at the first blank cell (block-terminated, not the
+' sheet's UsedRange). Returns startRow - 1 if the first cell is blank.
+'-----------------------------------------------------------------
+Public Function LastRowIn(ByVal ws As Worksheet, _
+                          ByVal col As Long, _
+                          ByVal startRow As Long) As Long
+    Dim r As Long
+    r = startRow
+    Do While Len(Trim$(CStr(ws.Cells(r, col).Value))) > 0
+        r = r + 1
+    Loop
+    LastRowIn = r - 1
+End Function
+
+'-----------------------------------------------------------------
+' For an ALT key of the form "Section_Option", returns the Option
+' part (everything AFTER the first underscore). If there is no
+' underscore the whole key is returned.
+' e.g. "Currency_USD"   -> "USD"
+'      "Currency_USD_2" -> "USD_2"  (only the FIRST underscore splits)
+'      "Flag"           -> "Flag"
+'-----------------------------------------------------------------
+Public Function OptionLabelFromKey(ByVal fullKey As String) As String
+    Dim p As Long
+    p = InStr(1, fullKey, "_")
+    If p = 0 Then
+        OptionLabelFromKey = fullKey
+    Else
+        OptionLabelFromKey = Mid$(fullKey, p + 1)
+    End If
+End Function
+
+'-----------------------------------------------------------------
+' For an ALT key of the form "Section_Option", returns the Section
+' part (everything BEFORE the first underscore). If there is no
+' underscore the whole key is returned.
+'-----------------------------------------------------------------
+Public Function SectionFromKey(ByVal fullKey As String) As String
+    Dim p As Long
+    p = InStr(1, fullKey, "_")
+    If p = 0 Then
+        SectionFromKey = fullKey
+    Else
+        SectionFromKey = Left$(fullKey, p - 1)
+    End If
+End Function
