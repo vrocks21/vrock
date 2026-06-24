@@ -1,0 +1,30 @@
+'=================================================================
+' ThisWorkbook  (code-behind)
+'
+' HOW TO INSTALL:
+'   In the VBA editor, double-click "ThisWorkbook" under
+'   VBAProject (YourFile.xlsm) in the Project Explorer and paste the
+'   code below into that code pane. Do NOT put this in a standard
+'   module — it must live behind the ThisWorkbook object to receive
+'   the Workbook_Open event.
+'=================================================================
+Option Explicit
+
+Private Sub Workbook_Open()
+    ' Keep the working sheets hidden from the user every time the file
+    ' opens, and land them on the Dashboard.
+    On Error Resume Next
+
+    If SheetExists(SHEET_PLACEHLDR) Then
+        ThisWorkbook.Worksheets(SHEET_PLACEHLDR).Visible = xlSheetVeryHidden
+    End If
+    If SheetExists(SHEET_ALT) Then
+        ThisWorkbook.Worksheets(SHEET_ALT).Visible = xlSheetVeryHidden
+    End If
+
+    If SheetExists(SHEET_DASHBOARD) Then
+        ThisWorkbook.Worksheets(SHEET_DASHBOARD).Activate
+    End If
+
+    On Error GoTo 0
+End Sub
