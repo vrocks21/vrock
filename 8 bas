@@ -1,0 +1,225 @@
+Attribute VB_Name = "modMain"
+'=================================================================
+' modMain
+' The two macros wired to the Dashboard buttons. These are the only
+' procedures the user ever triggers directly.
+'=================================================================
+Option Explicit
+
+'-----------------------------------------------------------------
+' Button: "Load Transaction"
+' Validates the selected type, scans its template, and builds the
+' transaction input sheet.
+'-----------------------------------------------------------------
+Public Sub LoadTransaction()
+    Dim transType As String
+
+    On Error GoTo Fail
+    Application.ScreenUpdating = False
+
+    transType = GetSelectedTransactionType()
+    If Len(transType) = 0 Then
+        MsgBox "Please select a Transaction Type first.", _
+               vbExclamation, "Load Transaction"
+        GoTo Done
+    End If
+
+    If GetConfigRowByType(transType) = 0 Then
+        MsgBox "Transaction Type '" & transType & "' is not listed on " & _
+               "the Config sheet.", vbExclamation, "Load Transaction"
+        GoTo Done
+    End If
+
+    SetStatus "Loading template for " & transType & "..."
+
+    ScanTemplateAndBuild transType
+
+    SetStatus "Loaded '" & transType & "'. Enter values, then click " & _
+              "Generate Document."
+
+Done:
+    Application.ScreenUpdating = True
+    Exit Sub
+
+Fail:
+    Application.ScreenUpdating = True
+    SetStatus "Load failed."
+    MsgBox "Could not load the transaction." & vbCrLf & vbCrLf & _
+           Err.Description, vbCritical, "Load Transaction"
+End Sub
+
+'-----------------------------------------------------------------
+' Button: "Generate Document"
+' Gathers master values + transaction inputs + ALT selections and
+' produces the final Word document. Warns on blank or unresolved
+' placeholders.
+'-----------------------------------------------------------------
+Public Sub GenerateDocument()
+    Dim transType As String
+    Dim tplPath As String
+    Dim sheetName As String
+    Dim data As Object
+    Dim altSel As Object
+    Dim outPath As String
+    Dim unresolved As Collection
+    Dim blanks As Collection
+    Dim ok As Boolean
+    Dim resp As VbMsgBoxResult
+
+    On Error GoTo Fail
+    Randomize
+
+    transType = GetSelectedTransactionType()
+    If Len(transType) = 0 Then
+        MsgBox "Please select a Transaction Type first.", _
+               vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+
+    If GetConfigRowByType(transType) = 0 Then
+        MsgBox "Transaction Type '" & transType & "' is not on the " & _
+               "Config sheet.", vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+
+    tplPath = GetResolvedTemplatePath(transType)
+    If Not FileExists(tplPath) Then
+        MsgBox "Template file not found:" & vbCrLf & tplPath, _
+               vbCritical, "Generate Document"
+        Exit Sub
+    End If
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Not SheetExists(sheetName) Then
+        MsgBox "The transaction sheet for '" & transType & "' does not " & _
+               "exist yet. Click Load Transaction first.", _
+               vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+    If Not SheetExists(SHEET_PLACEHLDR) Then
+        MsgBox "Template has not been scanned yet. Click Load " & _
+               "Transaction first.", vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+
+    '--- Assemble inputs. Master values first; transaction inputs
+    '    exclude master fields by construction, so there is no clash.
+    Set data = GetMasterValues()
+    MergeInto data, ReadTransactionInputs(transType)
+    Set altSel = ReadAltSelections(transType)
+
+    '--- Warn (do not block) on blank values for fields the template
+    '    actually contains.
+    Set blanks = FindBlankPlaceholders(data)
+    If blanks.Count > 0 Then
+        resp = MsgBox("These fields are blank:" & vbCrLf & vbCrLf & _
+                      CollectionToText(blanks, vbCrLf) & vbCrLf & vbCrLf & _
+                      "Generate the document anyway?", _
+                      vbYesNo + vbQuestion, "Blank fields")
+        If resp <> vbYes Then
+            SetStatus "Generation cancelled."
+            Exit Sub
+        End If
+    End If
+
+    outPath = ThisWorkbook.Path & "\" & SanitizeFileName(transType) & _
+              "_" & Format$(Now, "yyyymmdd_hhnnss") & ".docx"
+
+    SetStatus "Generating document..."
+
+    ok = BuildWordDocument(tplPath, data, altSel, outPath, unresolved)
+
+    If ok Then
+        If Not unresolved Is Nothing Then
+            If unresolved.Count > 0 Then
+                MsgBox "Document generated, but some placeholders were " & _
+                       "left unresolved:" & vbCrLf & vbCrLf & _
+                       CollectionToText(unresolved, vbCrLf) & vbCrLf & vbCrLf & _
+                       "Saved to:" & vbCrLf & outPath, _
+                       vbExclamation, "Generated with warnings"
+                SetStatus "Generated with " & unresolved.Count & _
+                          " unresolved placeholder(s)."
+                Exit Sub
+            End If
+        End If
+        MsgBox "Document generated successfully." & vbCrLf & vbCrLf & _
+               "Saved to:" & vbCrLf & outPath, _
+               vbInformation, "Done"
+        SetStatus "Document generated."
+    Else
+        SetStatus "Generation failed."
+        MsgBox "Document generation did not complete.", _
+               vbCritical, "Generate Document"
+    End If
+    Exit Sub
+
+Fail:
+    SetStatus "Generation failed."
+    MsgBox "Could not generate the document." & vbCrLf & vbCrLf & _
+           Err.Description, vbCritical, "Generate Document"
+End Sub
+
+'-----------------------------------------------------------------
+' Copies all entries from src into dest (dest wins on key clash kept
+' as-is; here src overrides only when dest lacks the key, preserving
+' master values). Both are Dictionaries.
+'-----------------------------------------------------------------
+Private Sub MergeInto(ByVal dest As Object, ByVal src As Object)
+    Dim k As Variant
+    If src Is Nothing Then Exit Sub
+    For Each k In src.Keys
+        If Not dest.Exists(k) Then
+            dest.Add k, src.Item(k)
+        Else
+            dest.Item(k) = src.Item(k)
+        End If
+    Next k
+End Sub
+
+'-----------------------------------------------------------------
+' Returns the names of placeholders (present in the scanned template)
+' whose supplied value is blank, so the user can be warned.
+'-----------------------------------------------------------------
+Private Function FindBlankPlaceholders(ByVal data As Object) As Collection
+    Dim col As New Collection
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim nm As String, val As String
+
+    If Not SheetExists(SHEET_PLACEHLDR) Then
+        Set FindBlankPlaceholders = col
+        Exit Function
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_PLACEHLDR)
+    lastRow = LastRowIn(ws, 1, 2)
+
+    For r = 2 To lastRow
+        nm = Trim$(CStr(ws.Cells(r, 1).Value))
+        If Len(nm) > 0 Then
+            If data.Exists(nm) Then
+                val = CStr(data.Item(nm))
+            Else
+                val = ""
+            End If
+            If Len(Trim$(val)) = 0 Then col.Add nm
+        End If
+    Next r
+
+    Set FindBlankPlaceholders = col
+End Function
+
+'-----------------------------------------------------------------
+' Makes a string safe to use as a Windows file name.
+'-----------------------------------------------------------------
+Public Function SanitizeFileName(ByVal s As String) As String
+    Dim bad As Variant, i As Long, out As String
+    out = s
+    bad = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(bad) To UBound(bad)
+        out = Replace(out, CStr(bad(i)), "_")
+    Next i
+    out = Trim$(out)
+    If Len(out) = 0 Then out = "Document"
+    SanitizeFileName = out
+End Function
