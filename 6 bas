@@ -1,0 +1,327 @@
+Attribute VB_Name = "modUI"
+'=================================================================
+' modUI
+' Builds the visible transaction input sheet from the working sheets
+' (placeholder list + ALT list) and reads the user's entries back.
+'
+' The BUILD layout and the READ layout share the same constants so
+' the two can never drift apart.
+'=================================================================
+Option Explicit
+
+'--- Transaction-sheet layout constants -----------------------------
+Public Const TS_TITLE_CELL    As String = "B1"
+
+Public Const TS_PH_HEADER_ROW As Long = 3
+Public Const TS_PH_FIELD_COL  As Long = 2     ' column B : field name
+Public Const TS_PH_VALUE_COL  As Long = 3     ' column C : value entry
+
+Public Const TS_ALT_HEADER_ROW As Long = 3
+Public Const TS_ALT_SEC_COL    As Long = 5    ' column E : section
+Public Const TS_ALT_SEL_COL    As Long = 6    ' column F : selection
+
+Public Const TS_FIRST_DATA_ROW As Long = 4    ' first row beneath headers
+
+Public Const ALT_NONE As String = "None"
+
+'-----------------------------------------------------------------
+' Builds (or rebuilds) the visible transaction sheet for a type:
+'   - placeholder fields (excluding master fields) down column B/C
+'   - ALT section dropdowns down column E/F
+'-----------------------------------------------------------------
+Public Sub BuildTransactionSheet(ByVal transType As String)
+    Dim sheetName As String
+    Dim ws As Worksheet
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Err.Raise ERR_BASE + 201, "BuildTransactionSheet", _
+            "No transaction sheet configured for '" & transType & "'."
+    End If
+
+    Set ws = EnsureSheet(sheetName, True)
+    ws.Cells.Clear
+    ClearValidation ws
+
+    '--- Title.
+    ws.Range(TS_TITLE_CELL).Value = transType & " — Transaction Inputs"
+    ws.Range(TS_TITLE_CELL).Font.Bold = True
+    ws.Range(TS_TITLE_CELL).Font.Size = 14
+
+    BuildPlaceholderTable ws
+    BuildAltDropdowns ws
+
+    ws.Columns("B:F").AutoFit
+    On Error Resume Next
+    ws.Columns("C").ColumnWidth = 40
+    ws.Columns("F").ColumnWidth = 24
+    On Error GoTo 0
+
+    ShowTransactionSheet transType
+End Sub
+
+'-----------------------------------------------------------------
+' Lays out the placeholder field/value table on a sheet, skipping any
+' placeholder whose name matches a master field (case-insensitive),
+' so master inputs are never duplicated on the transaction sheet.
+'-----------------------------------------------------------------
+Private Sub BuildPlaceholderTable(ByVal ws As Worksheet)
+    Dim src As Worksheet
+    Dim masterNames As Object
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim nm As String
+
+    '--- Header.
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_FIELD_COL).Value = "Field"
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_VALUE_COL).Value = "Value"
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_FIELD_COL).Font.Bold = True
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_VALUE_COL).Font.Bold = True
+
+    If Not SheetExists(SHEET_PLACEHLDR) Then Exit Sub
+    Set src = ThisWorkbook.Worksheets(SHEET_PLACEHLDR)
+    Set masterNames = GetMasterFieldNames()
+
+    lastRow = LastRowIn(src, 1, 2)
+    outRow = TS_FIRST_DATA_ROW
+
+    For r = 2 To lastRow
+        nm = Trim$(CStr(src.Cells(r, 1).Value))
+        If Len(nm) > 0 Then
+            If Not masterNames.Exists(nm) Then
+                ws.Cells(outRow, TS_PH_FIELD_COL).Value = nm
+                ' Light visual cue for the editable value cell.
+                ws.Cells(outRow, TS_PH_VALUE_COL).Interior.Color = RGB(255, 255, 204)
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+
+    If outRow = TS_FIRST_DATA_ROW Then
+        ws.Cells(TS_FIRST_DATA_ROW, TS_PH_FIELD_COL).Value = _
+            "(no transaction-specific fields in this template)"
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Builds one dropdown per ALT section in column E/F. Options are the
+' section's option labels in first-seen order, with "None" appended.
+' Default selection is "None".
+'-----------------------------------------------------------------
+Private Sub BuildAltDropdowns(ByVal ws As Worksheet)
+    Dim src As Worksheet
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim sectionsSeen As Object         ' section -> row written
+    Dim optionLists As Object          ' section -> comma list of labels
+    Dim secName As String, optLabel As String
+    Dim listText As String
+    Dim k As Variant
+
+    '--- Header.
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEC_COL).Value = "Optional Section"
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEL_COL).Value = "Selection"
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEC_COL).Font.Bold = True
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEL_COL).Font.Bold = True
+
+    If Not SheetExists(SHEET_ALT) Then Exit Sub
+    Set src = ThisWorkbook.Worksheets(SHEET_ALT)
+
+    Set sectionsSeen = NewDict()
+    sectionsSeen.CompareMode = 1
+    Set optionLists = NewDict()
+    optionLists.CompareMode = 1
+
+    '--- Accumulate option labels per section in first-seen order.
+    Dim order As Collection
+    Set order = New Collection
+    lastRow = LastRowIn(src, 1, 2)
+
+    For r = 2 To lastRow
+        secName = Trim$(CStr(src.Cells(r, 1).Value))
+        optLabel = Trim$(CStr(src.Cells(r, 2).Value))
+        If Len(secName) > 0 Then
+            If Not optionLists.Exists(secName) Then
+                optionLists.Add secName, optLabel
+                order.Add secName
+            Else
+                optionLists.Item(secName) = optionLists.Item(secName) & "," & optLabel
+            End If
+        End If
+    Next r
+
+    '--- Write one dropdown row per section.
+    outRow = TS_FIRST_DATA_ROW
+    For Each k In order
+        secName = CStr(k)
+        listText = optionLists.Item(secName) & "," & ALT_NONE
+
+        ws.Cells(outRow, TS_ALT_SEC_COL).Value = secName
+        ApplyListValidation ws.Cells(outRow, TS_ALT_SEL_COL), listText
+        ws.Cells(outRow, TS_ALT_SEL_COL).Value = ALT_NONE
+        ws.Cells(outRow, TS_ALT_SEL_COL).Interior.Color = RGB(220, 230, 241)
+
+        outRow = outRow + 1
+    Next k
+
+    If outRow = TS_FIRST_DATA_ROW Then
+        ws.Cells(TS_FIRST_DATA_ROW, TS_ALT_SEC_COL).Value = _
+            "(no optional sections in this template)"
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Applies an in-cell list validation. Excel limits the inline list
+' source to ~255 characters; if the list is longer we fall back to a
+' free-text cell rather than failing the whole build.
+'-----------------------------------------------------------------
+Private Sub ApplyListValidation(ByVal target As Range, ByVal listText As String)
+    On Error GoTo FreeText
+    With target.Validation
+        .Delete
+        If Len(listText) <= 255 Then
+            .Add Type:=xlValidateList, _
+                 AlertStyle:=xlValidAlertStop, _
+                 Operator:=xlBetween, _
+                 Formula1:=listText
+            .IgnoreBlank = True
+            .InCellDropdown = True
+        End If
+    End With
+    Exit Sub
+FreeText:
+    ' Leave the cell as plain free-text entry.
+    On Error Resume Next
+    target.Validation.Delete
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' Removes all data validation from a worksheet (used before rebuild).
+'-----------------------------------------------------------------
+Private Sub ClearValidation(ByVal ws As Worksheet)
+    On Error Resume Next
+    ws.Cells.Validation.Delete
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' Reads transaction-specific field values from the visible sheet into
+' a Dictionary of field name -> value. Note rows (field text wrapped
+' in parentheses) are skipped.
+'-----------------------------------------------------------------
+Public Function ReadTransactionInputs(ByVal transType As String) As Object
+    Dim d As Object, ws As Worksheet
+    Dim sheetName As String
+    Dim lastRow As Long, r As Long
+    Dim nm As String, val As String
+
+    Set d = NewDict()
+    d.CompareMode = 1
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Set ReadTransactionInputs = d
+        Exit Function
+    End If
+    If Not SheetExists(sheetName) Then
+        Set ReadTransactionInputs = d
+        Exit Function
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    lastRow = LastRowIn(ws, TS_PH_FIELD_COL, TS_FIRST_DATA_ROW)
+
+    For r = TS_FIRST_DATA_ROW To lastRow
+        nm = Trim$(CStr(ws.Cells(r, TS_PH_FIELD_COL).Value))
+        If Len(nm) > 0 Then
+            If Left$(nm, 1) <> "(" Then         ' skip note rows
+                val = CStr(ws.Cells(r, TS_PH_VALUE_COL).Value)
+                If Not d.Exists(nm) Then d.Add nm, val
+            End If
+        End If
+    Next r
+
+    Set ReadTransactionInputs = d
+End Function
+
+'-----------------------------------------------------------------
+' Reads ALT section selections from the visible sheet into a
+' Dictionary of section -> selection. A blank cell is treated as None.
+'-----------------------------------------------------------------
+Public Function ReadAltSelections(ByVal transType As String) As Object
+    Dim d As Object, ws As Worksheet
+    Dim sheetName As String
+    Dim lastRow As Long, r As Long
+    Dim secName As String, sel As String
+
+    Set d = NewDict()
+    d.CompareMode = 1
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Set ReadAltSelections = d
+        Exit Function
+    End If
+    If Not SheetExists(sheetName) Then
+        Set ReadAltSelections = d
+        Exit Function
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    lastRow = LastRowIn(ws, TS_ALT_SEC_COL, TS_FIRST_DATA_ROW)
+
+    For r = TS_FIRST_DATA_ROW To lastRow
+        secName = Trim$(CStr(ws.Cells(r, TS_ALT_SEC_COL).Value))
+        If Len(secName) > 0 Then
+            If Left$(secName, 1) <> "(" Then
+                sel = Trim$(CStr(ws.Cells(r, TS_ALT_SEL_COL).Value))
+                If Len(sel) = 0 Then sel = ALT_NONE
+                If Not d.Exists(secName) Then d.Add secName, sel
+            End If
+        End If
+    Next r
+
+    Set ReadAltSelections = d
+End Function
+
+'-----------------------------------------------------------------
+' Shows the transaction sheet for a type and hides the OTHER
+' transaction sheets listed in Config to keep the workbook tidy.
+'-----------------------------------------------------------------
+Public Sub ShowTransactionSheet(ByVal transType As String)
+    Dim sheetName As String
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then Exit Sub
+
+    HideOtherTransactionSheets sheetName
+
+    If SheetExists(sheetName) Then
+        With ThisWorkbook.Worksheets(sheetName)
+            .Visible = xlSheetVisible
+            .Activate
+        End With
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Hides every Config-listed transaction sheet except keepName.
+'-----------------------------------------------------------------
+Public Sub HideOtherTransactionSheets(ByVal keepName As String)
+    Dim rng As Range, r As Long, nm As String
+    Set rng = ConfigData()
+    If rng Is Nothing Then Exit Sub
+
+    For r = 1 To rng.Rows.Count
+        nm = Trim$(CStr(rng.Cells(r, CFG_COL_SHEET).Value))
+        If Len(nm) = 0 Then
+            If Len(Trim$(CStr(rng.Cells(r, CFG_COL_TYPE).Value))) = 0 Then Exit For
+        Else
+            If StrComp(nm, keepName, vbTextCompare) <> 0 Then
+                If SheetExists(nm) Then
+                    On Error Resume Next
+                    ThisWorkbook.Worksheets(nm).Visible = xlSheetHidden
+                    On Error GoTo 0
+                End If
+            End If
+        End If
+    Next r
+End Sub
