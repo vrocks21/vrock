@@ -1,0 +1,206 @@
+Attribute VB_Name = "modConfig"
+'=================================================================
+' modConfig
+' Single home for every sheet name, named-range name, column offset
+' and Config-sheet accessor in the project.
+'
+' No template path is ever hardcoded here. Paths live only in the
+' Config worksheet and are resolved at run time.
+'=================================================================
+Option Explicit
+
+'--- Worksheet names ------------------------------------------------
+Public Const SHEET_DASHBOARD As String = "Dashboard"
+Public Const SHEET_CONFIG    As String = "Config"
+Public Const SHEET_PLACEHLDR As String = "wPlaceholders"  ' very hidden
+Public Const SHEET_ALT       As String = "wAlt"           ' very hidden
+
+'--- Named ranges ---------------------------------------------------
+Public Const NR_TRANS_TYPE   As String = "nTransType"
+Public Const NR_MASTER_TABLE As String = "nMasterTable"
+Public Const NR_CONFIG_TABLE As String = "nConfigTable"
+Public Const NR_STATUS       As String = "nStatus"
+
+'--- Config table column offsets (relative to the config range) -----
+Public Const CFG_COL_TYPE  As Long = 1   ' Transaction Type
+Public Const CFG_COL_PATH  As Long = 2   ' Template Path
+Public Const CFG_COL_SHEET As Long = 3   ' Associated Transaction Sheet
+Public Const CFG_COL_DESC  As Long = 4   ' Template Description
+
+'-----------------------------------------------------------------
+' The transaction type the user has currently selected on the
+' Dashboard (named range nTransType). Trimmed. May be empty.
+'-----------------------------------------------------------------
+Public Function GetSelectedTransactionType() As String
+    On Error Resume Next
+    GetSelectedTransactionType = _
+        Trim$(CStr(ThisWorkbook.Names(NR_TRANS_TYPE).RefersToRange.Value))
+    On Error GoTo 0
+End Function
+
+' Backwards-compatible alias used by some callers.
+Public Function GetSelectedTransType() As String
+    GetSelectedTransType = GetSelectedTransactionType()
+End Function
+
+'-----------------------------------------------------------------
+' Writes a short status string to the Dashboard status cell.
+'-----------------------------------------------------------------
+Public Sub SetStatus(ByVal msg As String)
+    On Error Resume Next
+    ThisWorkbook.Names(NR_STATUS).RefersToRange.Value = msg
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' The Config data range (named range nConfigTable). Row 1 of this
+' range is the first DATA row (headers sit just above it).
+'-----------------------------------------------------------------
+Public Function ConfigData() As Range
+    On Error Resume Next
+    Set ConfigData = ThisWorkbook.Names(NR_CONFIG_TABLE).RefersToRange
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------
+' Finds the Config row index (1-based, within the config range) for
+' a given transaction type. Returns 0 if not found.
+'-----------------------------------------------------------------
+Public Function GetConfigRowByType(ByVal transType As String) As Long
+    Dim rng As Range, r As Long, cellVal As String
+    Set rng = ConfigData()
+    If rng Is Nothing Then Exit Function
+
+    For r = 1 To rng.Rows.Count
+        cellVal = Trim$(CStr(rng.Cells(r, CFG_COL_TYPE).Value))
+        If Len(cellVal) = 0 Then Exit For          ' stop at first blank row
+        If StrComp(cellVal, Trim$(transType), vbTextCompare) = 0 Then
+            GetConfigRowByType = r
+            Exit Function
+        End If
+    Next r
+End Function
+
+'-----------------------------------------------------------------
+' Reads a single column value from the Config row of a given type.
+' Returns "" if the type or value is not found.
+'-----------------------------------------------------------------
+Public Function GetConfigValue(ByVal transType As String, _
+                               ByVal colOffset As Long) As String
+    Dim rng As Range, r As Long
+    r = GetConfigRowByType(transType)
+    If r = 0 Then Exit Function
+    Set rng = ConfigData()
+    GetConfigValue = Trim$(CStr(rng.Cells(r, colOffset).Value))
+End Function
+
+'-----------------------------------------------------------------
+' Raw (unresolved) template path for a type, straight from Config.
+'-----------------------------------------------------------------
+Public Function GetTemplatePathForType(ByVal transType As String) As String
+    GetTemplatePathForType = GetConfigValue(transType, CFG_COL_PATH)
+End Function
+
+'-----------------------------------------------------------------
+' Transaction sheet name associated with a type.
+'-----------------------------------------------------------------
+Public Function GetTransactionSheetForType(ByVal transType As String) As String
+    GetTransactionSheetForType = GetConfigValue(transType, CFG_COL_SHEET)
+End Function
+
+'-----------------------------------------------------------------
+' Human-readable description for a type.
+'-----------------------------------------------------------------
+Public Function GetTemplateDescriptionForType(ByVal transType As String) As String
+    GetTemplateDescriptionForType = GetConfigValue(transType, CFG_COL_DESC)
+End Function
+
+'-----------------------------------------------------------------
+' Resolves a raw Config path into an absolute path.
+'  - Absolute paths (drive "X:\..." or UNC "\\server\...") are used as-is.
+'  - The token {WB} expands to ThisWorkbook.Path.
+'  - Anything else is treated as relative to ThisWorkbook.Path.
+'-----------------------------------------------------------------
+Public Function ResolveTemplatePath(ByVal rawPath As String) As String
+    Dim p As String
+    p = Trim$(rawPath)
+    If Len(p) = 0 Then Exit Function
+
+    ' Expand the workbook-folder token first.
+    If InStr(1, p, "{WB}", vbTextCompare) > 0 Then
+        p = Replace(p, "{WB}", ThisWorkbook.Path, 1, -1, vbTextCompare)
+    End If
+
+    ' Already absolute? (drive-letter colon or UNC double-backslash)
+    If Mid$(p, 2, 1) = ":" Or Left$(p, 2) = "\\" Then
+        ResolveTemplatePath = p
+        Exit Function
+    End If
+
+    ' Otherwise relative to the workbook folder.
+    If Left$(p, 1) = "\" Then p = Mid$(p, 2)
+    ResolveTemplatePath = ThisWorkbook.Path & "\" & p
+End Function
+
+'-----------------------------------------------------------------
+' Convenience: resolved, absolute template path for a type.
+'-----------------------------------------------------------------
+Public Function GetResolvedTemplatePath(ByVal transType As String) As String
+    GetResolvedTemplatePath = ResolveTemplatePath(GetTemplatePathForType(transType))
+End Function
+
+'=================================================================
+' Master input accessors
+' The master table (named range nMasterTable) is a two-column table:
+'   col 1 = field name, col 2 = value.
+' Master fields are shared across every transaction type.
+'=================================================================
+
+'--- The master table range (nMasterTable).
+Public Function GetMasterTable() As Range
+    On Error Resume Next
+    Set GetMasterTable = ThisWorkbook.Names(NR_MASTER_TABLE).RefersToRange
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------
+' A case-insensitive set of master field names (Dictionary whose
+' keys are the field names). Used to exclude master fields from the
+' per-transaction input table so nothing is duplicated.
+'-----------------------------------------------------------------
+Public Function GetMasterFieldNames() As Object
+    Dim d As Object, rng As Range, r As Long, nm As String
+    Set d = NewDict()
+    d.CompareMode = 1                       ' vbTextCompare -> case-insensitive
+    Set rng = GetMasterTable()
+    If rng Is Nothing Then
+        Set GetMasterFieldNames = d
+        Exit Function
+    End If
+    For r = 1 To rng.Rows.Count
+        nm = Trim$(CStr(rng.Cells(r, 1).Value))
+        If Len(nm) = 0 Then Exit For
+        If Not d.Exists(nm) Then d.Add nm, True
+    Next r
+    Set GetMasterFieldNames = d
+End Function
+
+'-----------------------------------------------------------------
+' A Dictionary of master field name -> value.
+'-----------------------------------------------------------------
+Public Function GetMasterValues() As Object
+    Dim d As Object, rng As Range, r As Long, nm As String
+    Set d = NewDict()
+    d.CompareMode = 1
+    Set rng = GetMasterTable()
+    If rng Is Nothing Then
+        Set GetMasterValues = d
+        Exit Function
+    End If
+    For r = 1 To rng.Rows.Count
+        nm = Trim$(CStr(rng.Cells(r, 1).Value))
+        If Len(nm) = 0 Then Exit For
+        If Not d.Exists(nm) Then d.Add nm, CStr(rng.Cells(r, 2).Value)
+    Next r
+    Set GetMasterValues = d
+End Function
