@@ -1,0 +1,24 @@
+'=================================================================
+' Dashboard sheet  (code-behind)
+'
+' HOW TO INSTALL:
+'   In the VBA editor, double-click the sheet whose (Name) is the
+'   Dashboard sheet under "Microsoft Excel Objects" in the Project
+'   Explorer, and paste the code below into that sheet's code pane.
+'   It must live behind the worksheet to receive Worksheet_Change.
+'
+' BEHAVIOUR:
+'   When the user picks a different Transaction Type in C4, the status
+'   line resets to prompt them to load it.
+'=================================================================
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    ' Only react to edits of the Transaction Type cell (C4).
+    If Intersect(Target, Me.Range("C4")) Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    SetStatus "Type changed to '" & GetSelectedTransactionType() & _
+              "'. Click Load Transaction."
+    On Error GoTo 0
+End Sub
