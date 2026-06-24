@@ -1,0 +1,220 @@
+Attribute VB_Name = "modSetup"
+'=================================================================
+' modSetup
+' One-click bootstrap. Run SetupWorkbook ONCE in a blank workbook and
+' it builds every sheet, named range, validation rule and button the
+' platform needs. Safe to re-run (it rebuilds in place).
+'
+' Excel's own object model (Worksheet, Range, Buttons, Validation,
+' RGB, the xl* constants) is intrinsically available to VBA, so this
+' module needs no project references. "Late binding / no references"
+' only concerns Word and the Scripting runtime, handled elsewhere.
+'=================================================================
+Option Explicit
+
+Public Sub SetupWorkbook()
+    Dim resp As VbMsgBoxResult
+    resp = MsgBox("This will build (or rebuild) the Dashboard, Config " & _
+                  "and working sheets, named ranges, dropdowns and " & _
+                  "buttons in THIS workbook." & vbCrLf & vbCrLf & _
+                  "Continue?", vbYesNo + vbQuestion, "Vinzor DocGen Setup")
+    If resp <> vbYes Then Exit Sub
+
+    Application.ScreenUpdating = False
+    On Error GoTo Fail
+
+    '--- Sheets.
+    EnsureSheet SHEET_DASHBOARD, True
+    EnsureSheet SHEET_CONFIG, True            ' visible; user may hide later
+    EnsureSheet SHEET_PLACEHLDR, False        ' very hidden working sheet
+    EnsureSheet SHEET_ALT, False              ' very hidden working sheet
+
+    BuildConfigSheet
+    BuildDashboardSheet
+    DefineNames
+    AddTransactionTypeValidation
+    AddButtons
+
+    ThisWorkbook.Worksheets(SHEET_DASHBOARD).Activate
+
+    Application.ScreenUpdating = True
+    MsgBox "Setup complete." & vbCrLf & vbCrLf & _
+           "Next: put your .docx templates in a 'Templates' subfolder " & _
+           "next to this workbook (or edit the paths on the Config " & _
+           "sheet), then use the Dashboard.", _
+           vbInformation, "Vinzor DocGen Setup"
+    Exit Sub
+
+Fail:
+    Application.ScreenUpdating = True
+    MsgBox "Setup failed:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor DocGen Setup"
+End Sub
+
+'-----------------------------------------------------------------
+' Builds the Config sheet headers and a set of sample rows. Paths use
+' the {WB} token so they resolve next to the workbook regardless of
+' where it lives.
+'-----------------------------------------------------------------
+Private Sub BuildConfigSheet()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_CONFIG)
+    ws.Cells.Clear
+
+    ws.Range("A1").Value = "Transaction Type"
+    ws.Range("B1").Value = "Template Path"
+    ws.Range("C1").Value = "Transaction Sheet"
+    ws.Range("D1").Value = "Description"
+    ws.Range("A1:D1").Font.Bold = True
+
+    Dim rows As Variant
+    rows = Array( _
+        Array("GMRA Repo", "{WB}\Templates\GMRA_Template.docx", _
+              "Transaction_GMRA", "GMRA repo confirmation"), _
+        Array("ISDA Transaction", "{WB}\Templates\ISDA_Template.docx", _
+              "Transaction_ISDA", "ISDA transaction confirmation"), _
+        Array("Securities Lending", "{WB}\Templates\SLA_Template.docx", _
+              "Transaction_SLA", "Securities lending confirmation"), _
+        Array("Collateral Swap Single", "{WB}\Templates\CS_Single_Template.docx", _
+              "Transaction_CS_SINGLE", "Single-document collateral swap"), _
+        Array("Collateral Swap Dual", "{WB}\Templates\CS_Dual_Template.docx", _
+              "Transaction_CS_DUAL", "Dual-leg collateral swap") _
+    )
+
+    Dim i As Long, r As Long
+    For i = LBound(rows) To UBound(rows)
+        r = 2 + i
+        ws.Cells(r, 1).Value = rows(i)(0)
+        ws.Cells(r, 2).Value = rows(i)(1)
+        ws.Cells(r, 3).Value = rows(i)(2)
+        ws.Cells(r, 4).Value = rows(i)(3)
+    Next i
+
+    ws.Columns("A:D").AutoFit
+End Sub
+
+'-----------------------------------------------------------------
+' Builds the Dashboard: title, type selector, status line, and the
+' master input table with common fields.
+'-----------------------------------------------------------------
+Private Sub BuildDashboardSheet()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_DASHBOARD)
+    ws.Cells.Clear
+
+    ws.Range("B2").Value = "Vinzor — Document Generator"
+    ws.Range("B2").Font.Bold = True
+    ws.Range("B2").Font.Size = 16
+
+    ws.Range("B4").Value = "Transaction Type:"
+    ws.Range("B4").Font.Bold = True
+    ws.Range("C4").Interior.Color = RGB(255, 255, 204)
+    ws.Range("C4").Borders.LineStyle = xlContinuous
+
+    ws.Range("B6").Value = "Status:"
+    ws.Range("B6").Font.Bold = True
+    ws.Range("C6").Value = "Select a Transaction Type, then click Load Transaction."
+
+    ws.Range("B9").Value = "MASTER INPUTS (shared across all transaction types)"
+    ws.Range("B9").Font.Bold = True
+    ws.Range("B9").Font.Size = 12
+
+    ws.Range("B11").Value = "Field"
+    ws.Range("C11").Value = "Value"
+    ws.Range("B11:C11").Font.Bold = True
+
+    Dim masters As Variant
+    masters = Array("Counterparty", "TradeDate", "EffectiveDate", _
+                    "Currency", "NoticeEmail", "GoverningLaw")
+
+    Dim i As Long, r As Long
+    For i = LBound(masters) To UBound(masters)
+        r = 12 + i
+        ws.Cells(r, 2).Value = masters(i)
+        ws.Cells(r, 3).Interior.Color = RGB(255, 255, 204)
+        ws.Cells(r, 3).Borders.LineStyle = xlContinuous
+    Next i
+
+    ws.Columns("B").ColumnWidth = 22
+    ws.Columns("C").ColumnWidth = 40
+End Sub
+
+'-----------------------------------------------------------------
+' (Re)defines the workbook named ranges used throughout the project.
+'-----------------------------------------------------------------
+Private Sub DefineNames()
+    DeleteNameIfExists NR_TRANS_TYPE
+    DeleteNameIfExists NR_STATUS
+    DeleteNameIfExists NR_MASTER_TABLE
+    DeleteNameIfExists NR_CONFIG_TABLE
+
+    ThisWorkbook.Names.Add Name:=NR_TRANS_TYPE, _
+        RefersTo:="=" & SHEET_DASHBOARD & "!$C$4"
+    ThisWorkbook.Names.Add Name:=NR_STATUS, _
+        RefersTo:="=" & SHEET_DASHBOARD & "!$C$6"
+    ThisWorkbook.Names.Add Name:=NR_MASTER_TABLE, _
+        RefersTo:="=" & SHEET_DASHBOARD & "!$B$12:$C$60"
+    ThisWorkbook.Names.Add Name:=NR_CONFIG_TABLE, _
+        RefersTo:="=" & SHEET_CONFIG & "!$A$2:$D$200"
+End Sub
+
+Private Sub DeleteNameIfExists(ByVal nm As String)
+    On Error Resume Next
+    ThisWorkbook.Names(nm).Delete
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' Adds the Transaction Type dropdown on the Dashboard, sourced from
+' the Config type column.
+'-----------------------------------------------------------------
+Private Sub AddTransactionTypeValidation()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_DASHBOARD)
+
+    On Error Resume Next
+    ws.Range("C4").Validation.Delete
+    On Error GoTo 0
+
+    With ws.Range("C4").Validation
+        .Add Type:=xlValidateList, _
+             AlertStyle:=xlValidAlertStop, _
+             Operator:=xlBetween, _
+             Formula1:="=" & SHEET_CONFIG & "!$A$2:$A$200"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+    End With
+End Sub
+
+'-----------------------------------------------------------------
+' Adds the two Form-control buttons to the Dashboard and wires them to
+' their macros. Existing copies are removed first so re-running setup
+' does not stack duplicates.
+'-----------------------------------------------------------------
+Private Sub AddButtons()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_DASHBOARD)
+
+    RemoveButtons ws
+
+    Dim b As Object
+
+    Set b = ws.Buttons.Add(ws.Range("E4").Left, ws.Range("E4").Top, 130, 28)
+    b.Name = "btnLoadTransaction"
+    b.Caption = "Load Transaction"
+    b.OnAction = "LoadTransaction"
+
+    Set b = ws.Buttons.Add(ws.Range("G4").Left, ws.Range("G4").Top, 130, 28)
+    b.Name = "btnGenerateDocument"
+    b.Caption = "Generate Document"
+    b.OnAction = "GenerateDocument"
+End Sub
+
+Private Sub RemoveButtons(ByVal ws As Worksheet)
+    Dim btn As Object
+    On Error Resume Next
+    For Each btn In ws.Buttons
+        btn.Delete
+    Next btn
+    On Error GoTo 0
+End Sub
