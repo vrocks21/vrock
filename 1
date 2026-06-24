@@ -1,0 +1,2314 @@
+# Vinzor Document Generator — Complete Implementation Package
+
+A template-driven Excel + VBA + Word platform that generates legal / financial transaction documents from Word templates. Adding a new transaction type requires **only** a new Word template plus **one** row on the Config sheet — never a code change.
+
+Everything that touches Word or the Scripting runtime is **late bound** (`CreateObject`), so the workbook needs no VBA references. The original template is never opened for editing; every document is built from a private working copy.
+
+---
+
+## Fastest path to a working file
+
+1. Create a new macro-enabled workbook (`.xlsm`).
+2. Open the VBA editor (`Alt`+`F11`). Add one standard module for each `.bas` file below and one class module for `clsAltSection`, then paste each file's contents in. Paste the two worksheet snippets behind `ThisWorkbook` and the Dashboard sheet (Part 7).
+3. Back in Excel, run the macro **`SetupWorkbook`** once (`Alt`+`F8` → `SetupWorkbook` → Run). It builds every sheet, named range, dropdown and button automatically.
+4. Drop your `.docx` templates into a `Templates` subfolder next to the workbook (or edit the paths on the Config sheet).
+5. Use the Dashboard: pick a type → **Load Transaction** → fill in values → **Generate Document**.
+
+> If you would rather not hand-create the modules, import the accompanying `.bas` / `.cls` files directly (VBA editor → *File ▸ Import File…*), then still paste the two Part 7 snippets behind their objects and run `SetupWorkbook`.
+
+---
+
+## PART 1 — Workbook Design
+
+### Goal and operating model
+
+The workbook is a thin, generic shell. All knowledge that varies by transaction type lives **outside** the VBA: in the Word templates (which tags exist) and in the Config sheet (which template maps to which type and sheet). The code reads those at run time and adapts.
+
+Two tag kinds are understood inside templates:
+
+- **Placeholders** — `<<Name>>`, e.g. `<<Counterparty>>`, `<<PurchasePrice>>`, `<<Leg1_ISIN>>`. Replaced with values.
+- **ALT blocks** — optional regions delimited by `<<ALT_Section_Option_START>>` … `<<ALT_Section_Option_END>>`. The user picks one option per section (or *None*); the chosen block is kept with its markers stripped, all sibling blocks are deleted.
+
+### End-to-end flow
+
+1. User opens the workbook → lands on the **Dashboard**.
+2. User selects a **Transaction Type** (dropdown sourced from Config).
+3. User clicks **Load Transaction**. The engine resolves the template path, opens it invisibly via late-bound Word, harvests text from every story (body, tables, headers, footers, text boxes, shapes), extracts and de-duplicates placeholders and ALT sections, writes them to two hidden working sheets, and builds the visible **transaction input sheet** (fields + ALT dropdowns).
+4. User fills in master inputs (on the Dashboard) and transaction-specific inputs (on the transaction sheet), and chooses ALT options.
+5. User clicks **Generate Document**. The engine copies the template to TEMP, processes ALT sections, replaces every placeholder everywhere, removes excessive blank paragraphs, scans for anything unresolved, saves the final `.docx` next to the workbook, and opens it in a visible Word window.
+
+### Design principles
+
+- **Template-driven / zero-maintenance placeholders.** The placeholder and ALT tables are rebuilt from the template on every load; nothing is hand-maintained.
+- **No hardcoded paths.** Template locations live only on Config and support a `{WB}` token (the workbook's own folder) plus absolute and relative paths.
+- **Late binding only.** Word and `Scripting.Dictionary` are created with `CreateObject`. No references to set, nothing to break across Office versions.
+- **Never mutate the original.** Generation always runs on a throwaway copy in TEMP.
+- **Master fields are shared, never duplicated.** Fields present in the master table are excluded from each transaction sheet.
+- **Round-trip-safe ALT handling.** The real option key is stored verbatim, so START/END markers reconstruct exactly even for unusual names.
+
+## PART 2 — Sheet Structure
+
+| Sheet | Visibility | Purpose |
+|-------|------------|---------|
+| `Dashboard` | Visible | Main UI: type selector, Load/Generate buttons, status line, master input table. |
+| `Config` | Visible (may be hidden) | Maps each transaction type to its template path, transaction sheet, and description. |
+| `Transaction_*` | Visible on demand | One per type (e.g. `Transaction_GMRA`). Auto-created/rebuilt on load. Holds transaction-specific fields and ALT dropdowns. |
+| `wPlaceholders` | Very hidden | Working sheet: the de-duplicated placeholder names from the last scan. |
+| `wAlt` | Very hidden | Working sheet: ALT sections — `Section`, `OptionLabel`, real `FullKey` — from the last scan. |
+
+### Dashboard layout
+
+| Cell | Content |
+|------|---------|
+| `B2` | Title — “Vinzor — Document Generator” |
+| `B4` | Label “Transaction Type:” |
+| `C4` | **Transaction Type** dropdown (named `nTransType`) |
+| `B6` | Label “Status:” |
+| `C6` | Status message (named `nStatus`) |
+| `E4` | **Load Transaction** button |
+| `G4` | **Generate Document** button |
+| `B9` | Section header “MASTER INPUTS” |
+| `B11:C11` | Master table header (`Field` / `Value`) |
+| `B12:C…` | Master fields and values (range `nMasterTable` covers `B12:C60`) |
+
+Default master fields seeded by setup: `Counterparty`, `TradeDate`, `EffectiveDate`, `Currency`, `NoticeEmail`, `GoverningLaw`. Add or remove rows freely within `B12:C60`.
+
+### Config layout
+
+| Column | Header | Meaning |
+|--------|--------|---------|
+| `A` | Transaction Type | Must match the dropdown value exactly. |
+| `B` | Template Path | `{WB}\Templates\X.docx`, absolute, or relative. |
+| `C` | Transaction Sheet | Sheet name to build (e.g. `Transaction_GMRA`). |
+| `D` | Description | Free text. |
+
+Data rows start at row 2; range `nConfigTable` covers `A2:D200`. **To add a transaction type, add a row here and drop in its template — nothing else.**
+
+### Transaction sheet layout (built automatically)
+
+| Region | Cells | Content |
+|--------|-------|---------|
+| Title | `B1` | “*Type* — Transaction Inputs” |
+| Field/value header | `B3:C3` | `Field` / `Value` |
+| Field/value rows | `B4:C…` | One row per non-master placeholder; value cell shaded for entry. |
+| ALT header | `E3:F3` | `Optional Section` / `Selection` |
+| ALT rows | `E4:F…` | One dropdown per ALT section; options + `None`, defaulting to `None`. |
+
+## PART 3 — Named Ranges
+
+All four are created (and re-created safely) by `SetupWorkbook`.
+
+| Name | Refers to | Used for |
+|------|-----------|----------|
+| `nTransType` | `Dashboard!$C$4` | The selected transaction type. |
+| `nStatus` | `Dashboard!$C$6` | Status message cell. |
+| `nMasterTable` | `Dashboard!$B$12:$C$60` | Master field/value table. |
+| `nConfigTable` | `Config!$A$2:$D$200` | Config data rows. |
+
+The ranges are intentionally generous (to row 60 / 200) and are scanned with blank-terminated loops, so unused rows cost nothing and you can grow the tables without redefining names.
+
+## PART 4 — Buttons and Controls
+
+### Buttons (Form controls, added by setup)
+
+| Button | Cell anchor | Macro (`OnAction`) |
+|--------|-------------|--------------------|
+| Load Transaction | `E4` | `LoadTransaction` |
+| Generate Document | `G4` | `GenerateDocument` |
+
+Form-control buttons are used (not ActiveX) for portability and to avoid reference/registration issues. `SetupWorkbook` removes any existing buttons before adding fresh ones, so it is safe to re-run.
+
+### Data validation (dropdowns)
+
+- **Transaction Type** (`Dashboard!C4`): list validation sourced from `Config!$A$2:$A$200`.
+- **ALT selections** (transaction sheet, column `F`): per-section list validation built from that section's options plus `None`. If a section's option list would exceed Excel's ~255-character inline limit, that cell falls back to free-text entry rather than failing.
+
+### Manual button setup (only if not using `SetupWorkbook`)
+
+Developer ▸ Insert ▸ Form Controls ▸ Button. Draw it, then in the *Assign Macro* dialog choose `LoadTransaction` (or `GenerateDocument`). Repeat for the second button.
+
+## PART 5 — VBA Architecture
+
+Eight code components, each with a single responsibility. Arrows show the call direction at the two entry points.
+
+- **`modUtils`** (Standard module) — Late-binding factories and file/sheet/string helpers.
+- **`clsAltSection`** (Class module) — Holds the real ALT option keys for one section.
+- **`modConfig`** (Standard module) — All names/constants plus Config & master accessors.
+- **`modScanner`** (Standard module) — Opens the template, harvests text, parses tags, writes working sheets.
+- **`modUI`** (Standard module) — Builds the transaction input sheet and reads entries back.
+- **`modWordGen`** (Standard module) — The late-bound Word generation engine.
+- **`modMain`** (Standard module) — The two button macros.
+- **`modSetup`** (Standard module) — One-click workbook bootstrap.
+
+**Load Transaction** → `modMain.LoadTransaction` → `modScanner.ScanTemplateAndBuild` → (`CollectTemplateText`, `ParseTags`, `WritePlaceholderSheet`, `WriteAltSheet`) → `modUI.BuildTransactionSheet`.
+
+**Generate Document** → `modMain.GenerateDocument` → (`GetMasterValues`, `ReadTransactionInputs`, `ReadAltSelections`) → `modWordGen.BuildWordDocument` → (`ProcessAltSections`, `ReplaceAllPlaceholders`, `CleanupBlankParagraphs`, `ScanUnresolved`).
+
+### Why these boundaries
+
+- **`modConfig` owns every literal** (sheet names, range names, column offsets). Change a layout once, here, and the whole project follows.
+- **`modUI` shares its layout constants between build and read**, so the sheet it writes is exactly the sheet it later parses.
+- **`clsAltSection` stores real keys**, guaranteeing marker reconstruction is exact.
+- **`modWordGen` is pure late binding** with its own copy of the handful of `wd*` numeric constants it needs.
+
+### ALT processing order (critical)
+
+ALT sections are resolved **before** placeholder replacement. That ordering means placeholders inside a *kept* block still get replaced, while placeholders inside a *deleted* block vanish with the block and never show up in the unresolved scan.
+
+### Error handling
+
+Every externally-triggered path has a handler that restores `ScreenUpdating`, writes a status, and shows a specific message. The engine raises described errors (`vbObjectError`-based) for: template not found, Word not installed, missing Config path/sheet, and open/copy/save failures. ALT structure problems (a `START` with no `END`, or vice versa) are reported as a non-fatal warning so the user can still inspect the result.
+
+## PART 6 — Complete VBA Code
+
+Paste each block into a module of the matching type (or import the files). All modules use `Option Explicit`.
+
+### `modUtils` — Standard module
+
+*Late-binding factories and file/sheet/string helpers.*
+
+```vba
+Attribute VB_Name = "modUtils"
+'=================================================================
+' modUtils
+' Low-level, dependency-free helpers shared across the project.
+'
+' All access to Word and the Scripting runtime is LATE BOUND here.
+' No project references are required for any of this to compile.
+'=================================================================
+Option Explicit
+
+' Custom error base. Anything we Raise uses vbObjectError + offset
+' so the numbers never collide with native VBA/Office error codes.
+Public Const ERR_BASE As Long = vbObjectError + 1500
+
+'-----------------------------------------------------------------
+' Late-bound Scripting.Dictionary factory.
+' Used everywhere instead of a referenced Scripting.Dictionary so
+' the workbook carries no library reference.
+'-----------------------------------------------------------------
+Public Function NewDict() As Object
+    Set NewDict = CreateObject("Scripting.Dictionary")
+End Function
+
+'-----------------------------------------------------------------
+' Late-bound VBScript RegExp factory.
+'-----------------------------------------------------------------
+Public Function NewRegExp() As Object
+    Set NewRegExp = CreateObject("VBScript.RegExp")
+End Function
+
+'-----------------------------------------------------------------
+' Late-bound Word.Application factory.
+' Raises a clean, described error if Word is not installed so the
+' caller can show a friendly message instead of an automation crash.
+'-----------------------------------------------------------------
+Public Function NewWordApp() As Object
+    On Error GoTo NoWord
+    Set NewWordApp = CreateObject("Word.Application")
+    Exit Function
+NoWord:
+    Err.Raise ERR_BASE + 1, "NewWordApp", _
+        "Microsoft Word could not be started. Word must be installed " & _
+        "on this machine to load templates and generate documents."
+End Function
+
+'-----------------------------------------------------------------
+' Returns True if a worksheet with the given name exists in ThisWorkbook.
+'-----------------------------------------------------------------
+Public Function SheetExists(ByVal sheetName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    SheetExists = Not ws Is Nothing
+End Function
+
+'-----------------------------------------------------------------
+' Ensures a worksheet with the given name exists and returns it.
+' Creates it if missing. makeVisible controls whether the sheet is
+' shown to the user or kept as a very-hidden working sheet.
+'-----------------------------------------------------------------
+Public Function EnsureSheet(ByVal sheetName As String, _
+                            ByVal makeVisible As Boolean) As Worksheet
+    Dim ws As Worksheet
+    If SheetExists(sheetName) Then
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+    Else
+        Set ws = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sheetName
+    End If
+
+    On Error Resume Next
+    If makeVisible Then
+        ws.Visible = xlSheetVisible
+    Else
+        ws.Visible = xlSheetVeryHidden
+    End If
+    On Error GoTo 0
+
+    Set EnsureSheet = ws
+End Function
+
+'-----------------------------------------------------------------
+' Path of the user's temp folder, no trailing separator.
+'-----------------------------------------------------------------
+Public Function TempFolderPath() As String
+    Dim p As String
+    p = Environ$("TEMP")
+    If Len(p) = 0 Then p = Environ$("TMP")
+    If Len(p) = 0 Then p = ThisWorkbook.Path
+    If Right$(p, 1) = "\" Then p = Left$(p, Len(p) - 1)
+    TempFolderPath = p
+End Function
+
+'-----------------------------------------------------------------
+' Deletes a file if it exists, swallowing any error (e.g. locked).
+'-----------------------------------------------------------------
+Public Sub SafeKill(ByVal filePath As String)
+    On Error Resume Next
+    If Len(Dir$(filePath)) > 0 Then Kill filePath
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' True if a file exists at the given path.
+'-----------------------------------------------------------------
+Public Function FileExists(ByVal filePath As String) As Boolean
+    On Error Resume Next
+    FileExists = (Len(filePath) > 0) And (Len(Dir$(filePath)) > 0)
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------
+' Joins a VBA.Collection of strings with the given separator.
+'-----------------------------------------------------------------
+Public Function CollectionToText(ByVal col As Collection, _
+                                 ByVal sep As String) As String
+    Dim i As Long, s As String
+    If col Is Nothing Then Exit Function
+    For i = 1 To col.Count
+        If i > 1 Then s = s & sep
+        s = s & CStr(col.Item(i))
+    Next i
+    CollectionToText = s
+End Function
+
+'-----------------------------------------------------------------
+' Last used row in a single column, scanning downward from startRow
+' and stopping at the first blank cell (block-terminated, not the
+' sheet's UsedRange). Returns startRow - 1 if the first cell is blank.
+'-----------------------------------------------------------------
+Public Function LastRowIn(ByVal ws As Worksheet, _
+                          ByVal col As Long, _
+                          ByVal startRow As Long) As Long
+    Dim r As Long
+    r = startRow
+    Do While Len(Trim$(CStr(ws.Cells(r, col).Value))) > 0
+        r = r + 1
+    Loop
+    LastRowIn = r - 1
+End Function
+
+'-----------------------------------------------------------------
+' For an ALT key of the form "Section_Option", returns the Option
+' part (everything AFTER the first underscore). If there is no
+' underscore the whole key is returned.
+' e.g. "Currency_USD"   -> "USD"
+'      "Currency_USD_2" -> "USD_2"  (only the FIRST underscore splits)
+'      "Flag"           -> "Flag"
+'-----------------------------------------------------------------
+Public Function OptionLabelFromKey(ByVal fullKey As String) As String
+    Dim p As Long
+    p = InStr(1, fullKey, "_")
+    If p = 0 Then
+        OptionLabelFromKey = fullKey
+    Else
+        OptionLabelFromKey = Mid$(fullKey, p + 1)
+    End If
+End Function
+
+'-----------------------------------------------------------------
+' For an ALT key of the form "Section_Option", returns the Section
+' part (everything BEFORE the first underscore). If there is no
+' underscore the whole key is returned.
+'-----------------------------------------------------------------
+Public Function SectionFromKey(ByVal fullKey As String) As String
+    Dim p As Long
+    p = InStr(1, fullKey, "_")
+    If p = 0 Then
+        SectionFromKey = fullKey
+    Else
+        SectionFromKey = Left$(fullKey, p - 1)
+    End If
+End Function
+```
+
+### `clsAltSection` — Class module
+
+*Holds the real ALT option keys for one section.*
+
+```vba
+VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "clsAltSection"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = False
+'=================================================================
+' clsAltSection
+' Represents one ALT Section discovered in a template (e.g. "Currency")
+' and the set of Option keys found for it (e.g. "Currency_USD",
+' "Currency_EUR").
+'
+' DESIGN NOTE (important):
+' We store the REAL full key exactly as parsed from the template,
+' never a recomputed "Section_Option" string. That guarantees the
+' START/END markers can be reconstructed byte-for-byte when we strip
+' or delete blocks later, even if a key contains extra underscores
+' or only a single token.
+'=================================================================
+Option Explicit
+
+Private pSectionName As String
+Private pKeys As Collection      ' of String, the real full keys
+
+Private Sub Class_Initialize()
+    Set pKeys = New Collection
+End Sub
+
+Private Sub Class_Terminate()
+    Set pKeys = Nothing
+End Sub
+
+'--- The section name (text before the first underscore of its keys).
+Public Property Get SectionName() As String
+    SectionName = pSectionName
+End Property
+Public Property Let SectionName(ByVal value As String)
+    pSectionName = value
+End Property
+
+'--- Add a real full key. Deduplicated via a keyed collection trick.
+Public Sub AddKey(ByVal fullKey As String)
+    If HasKey(fullKey) Then Exit Sub
+    pKeys.Add fullKey, "K::" & fullKey
+End Sub
+
+'--- True if this full key has already been recorded.
+Public Function HasKey(ByVal fullKey As String) As Boolean
+    Dim v As Variant
+    On Error Resume Next
+    v = pKeys.Item("K::" & fullKey)
+    HasKey = (Err.Number = 0)
+    On Error GoTo 0
+End Function
+
+'--- The collection of real full keys for this section.
+Public Property Get Keys() As Collection
+    Set Keys = pKeys
+End Property
+
+'--- Number of option keys recorded.
+Public Property Get Count() As Long
+    Count = pKeys.Count
+End Property
+```
+
+### `modConfig` — Standard module
+
+*All names/constants plus Config & master accessors.*
+
+```vba
+Attribute VB_Name = "modConfig"
+'=================================================================
+' modConfig
+' Single home for every sheet name, named-range name, column offset
+' and Config-sheet accessor in the project.
+'
+' No template path is ever hardcoded here. Paths live only in the
+' Config worksheet and are resolved at run time.
+'=================================================================
+Option Explicit
+
+'--- Worksheet names ------------------------------------------------
+Public Const SHEET_DASHBOARD As String = "Dashboard"
+Public Const SHEET_CONFIG    As String = "Config"
+Public Const SHEET_PLACEHLDR As String = "wPlaceholders"  ' very hidden
+Public Const SHEET_ALT       As String = "wAlt"           ' very hidden
+
+'--- Named ranges ---------------------------------------------------
+Public Const NR_TRANS_TYPE   As String = "nTransType"
+Public Const NR_MASTER_TABLE As String = "nMasterTable"
+Public Const NR_CONFIG_TABLE As String = "nConfigTable"
+Public Const NR_STATUS       As String = "nStatus"
+
+'--- Config table column offsets (relative to the config range) -----
+Public Const CFG_COL_TYPE  As Long = 1   ' Transaction Type
+Public Const CFG_COL_PATH  As Long = 2   ' Template Path
+Public Const CFG_COL_SHEET As Long = 3   ' Associated Transaction Sheet
+Public Const CFG_COL_DESC  As Long = 4   ' Template Description
+
+'-----------------------------------------------------------------
+' The transaction type the user has currently selected on the
+' Dashboard (named range nTransType). Trimmed. May be empty.
+'-----------------------------------------------------------------
+Public Function GetSelectedTransactionType() As String
+    On Error Resume Next
+    GetSelectedTransactionType = _
+        Trim$(CStr(ThisWorkbook.Names(NR_TRANS_TYPE).RefersToRange.Value))
+    On Error GoTo 0
+End Function
+
+' Backwards-compatible alias used by some callers.
+Public Function GetSelectedTransType() As String
+    GetSelectedTransType = GetSelectedTransactionType()
+End Function
+
+'-----------------------------------------------------------------
+' Writes a short status string to the Dashboard status cell.
+'-----------------------------------------------------------------
+Public Sub SetStatus(ByVal msg As String)
+    On Error Resume Next
+    ThisWorkbook.Names(NR_STATUS).RefersToRange.Value = msg
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' The Config data range (named range nConfigTable). Row 1 of this
+' range is the first DATA row (headers sit just above it).
+'-----------------------------------------------------------------
+Public Function ConfigData() As Range
+    On Error Resume Next
+    Set ConfigData = ThisWorkbook.Names(NR_CONFIG_TABLE).RefersToRange
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------
+' Finds the Config row index (1-based, within the config range) for
+' a given transaction type. Returns 0 if not found.
+'-----------------------------------------------------------------
+Public Function GetConfigRowByType(ByVal transType As String) As Long
+    Dim rng As Range, r As Long, cellVal As String
+    Set rng = ConfigData()
+    If rng Is Nothing Then Exit Function
+
+    For r = 1 To rng.Rows.Count
+        cellVal = Trim$(CStr(rng.Cells(r, CFG_COL_TYPE).Value))
+        If Len(cellVal) = 0 Then Exit For          ' stop at first blank row
+        If StrComp(cellVal, Trim$(transType), vbTextCompare) = 0 Then
+            GetConfigRowByType = r
+            Exit Function
+        End If
+    Next r
+End Function
+
+'-----------------------------------------------------------------
+' Reads a single column value from the Config row of a given type.
+' Returns "" if the type or value is not found.
+'-----------------------------------------------------------------
+Public Function GetConfigValue(ByVal transType As String, _
+                               ByVal colOffset As Long) As String
+    Dim rng As Range, r As Long
+    r = GetConfigRowByType(transType)
+    If r = 0 Then Exit Function
+    Set rng = ConfigData()
+    GetConfigValue = Trim$(CStr(rng.Cells(r, colOffset).Value))
+End Function
+
+'-----------------------------------------------------------------
+' Raw (unresolved) template path for a type, straight from Config.
+'-----------------------------------------------------------------
+Public Function GetTemplatePathForType(ByVal transType As String) As String
+    GetTemplatePathForType = GetConfigValue(transType, CFG_COL_PATH)
+End Function
+
+'-----------------------------------------------------------------
+' Transaction sheet name associated with a type.
+'-----------------------------------------------------------------
+Public Function GetTransactionSheetForType(ByVal transType As String) As String
+    GetTransactionSheetForType = GetConfigValue(transType, CFG_COL_SHEET)
+End Function
+
+'-----------------------------------------------------------------
+' Human-readable description for a type.
+'-----------------------------------------------------------------
+Public Function GetTemplateDescriptionForType(ByVal transType As String) As String
+    GetTemplateDescriptionForType = GetConfigValue(transType, CFG_COL_DESC)
+End Function
+
+'-----------------------------------------------------------------
+' Resolves a raw Config path into an absolute path.
+'  - Absolute paths (drive "X:\..." or UNC "\\server\...") are used as-is.
+'  - The token {WB} expands to ThisWorkbook.Path.
+'  - Anything else is treated as relative to ThisWorkbook.Path.
+'-----------------------------------------------------------------
+Public Function ResolveTemplatePath(ByVal rawPath As String) As String
+    Dim p As String
+    p = Trim$(rawPath)
+    If Len(p) = 0 Then Exit Function
+
+    ' Expand the workbook-folder token first.
+    If InStr(1, p, "{WB}", vbTextCompare) > 0 Then
+        p = Replace(p, "{WB}", ThisWorkbook.Path, 1, -1, vbTextCompare)
+    End If
+
+    ' Already absolute? (drive-letter colon or UNC double-backslash)
+    If Mid$(p, 2, 1) = ":" Or Left$(p, 2) = "\\" Then
+        ResolveTemplatePath = p
+        Exit Function
+    End If
+
+    ' Otherwise relative to the workbook folder.
+    If Left$(p, 1) = "\" Then p = Mid$(p, 2)
+    ResolveTemplatePath = ThisWorkbook.Path & "\" & p
+End Function
+
+'-----------------------------------------------------------------
+' Convenience: resolved, absolute template path for a type.
+'-----------------------------------------------------------------
+Public Function GetResolvedTemplatePath(ByVal transType As String) As String
+    GetResolvedTemplatePath = ResolveTemplatePath(GetTemplatePathForType(transType))
+End Function
+
+'=================================================================
+' Master input accessors
+' The master table (named range nMasterTable) is a two-column table:
+'   col 1 = field name, col 2 = value.
+' Master fields are shared across every transaction type.
+'=================================================================
+
+'--- The master table range (nMasterTable).
+Public Function GetMasterTable() As Range
+    On Error Resume Next
+    Set GetMasterTable = ThisWorkbook.Names(NR_MASTER_TABLE).RefersToRange
+    On Error GoTo 0
+End Function
+
+'-----------------------------------------------------------------
+' A case-insensitive set of master field names (Dictionary whose
+' keys are the field names). Used to exclude master fields from the
+' per-transaction input table so nothing is duplicated.
+'-----------------------------------------------------------------
+Public Function GetMasterFieldNames() As Object
+    Dim d As Object, rng As Range, r As Long, nm As String
+    Set d = NewDict()
+    d.CompareMode = 1                       ' vbTextCompare -> case-insensitive
+    Set rng = GetMasterTable()
+    If rng Is Nothing Then
+        Set GetMasterFieldNames = d
+        Exit Function
+    End If
+    For r = 1 To rng.Rows.Count
+        nm = Trim$(CStr(rng.Cells(r, 1).Value))
+        If Len(nm) = 0 Then Exit For
+        If Not d.Exists(nm) Then d.Add nm, True
+    Next r
+    Set GetMasterFieldNames = d
+End Function
+
+'-----------------------------------------------------------------
+' A Dictionary of master field name -> value.
+'-----------------------------------------------------------------
+Public Function GetMasterValues() As Object
+    Dim d As Object, rng As Range, r As Long, nm As String
+    Set d = NewDict()
+    d.CompareMode = 1
+    Set rng = GetMasterTable()
+    If rng Is Nothing Then
+        Set GetMasterValues = d
+        Exit Function
+    End If
+    For r = 1 To rng.Rows.Count
+        nm = Trim$(CStr(rng.Cells(r, 1).Value))
+        If Len(nm) = 0 Then Exit For
+        If Not d.Exists(nm) Then d.Add nm, CStr(rng.Cells(r, 2).Value)
+    Next r
+    Set GetMasterValues = d
+End Function
+```
+
+### `modScanner` — Standard module
+
+*Opens the template, harvests text, parses tags, writes working sheets.*
+
+```vba
+Attribute VB_Name = "modScanner"
+'=================================================================
+' modScanner
+' Loads a template via late-bound Word, harvests its text from every
+' story (body, tables, headers/footers, textboxes, shapes), parses
+' out placeholders and ALT sections, writes them to the two working
+' sheets, and triggers the transaction-sheet build.
+'
+' Word handling rule: we ALWAYS create a fresh, invisible Word
+' instance and Quit it when done. We never attach to an instance the
+' user already has open (GetObject), so we can never hide or close
+' the user's own Word session.
+'=================================================================
+Option Explicit
+
+'-----------------------------------------------------------------
+' Public entry point. Scans the template for a transaction type and
+' rebuilds its working sheets + transaction sheet.
+'-----------------------------------------------------------------
+Public Sub ScanTemplateAndBuild(ByVal transType As String)
+    Dim tplPath As String
+    Dim sheetName As String
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Dim fullText As String
+    Dim placeholders As Object       ' Dictionary: name -> True
+    Dim sections As Object           ' Dictionary: section -> clsAltSection
+
+    '--- Validate configuration before opening anything.
+    tplPath = GetResolvedTemplatePath(transType)
+    If Len(tplPath) = 0 Then
+        Err.Raise ERR_BASE + 101, "ScanTemplateAndBuild", _
+            "No template path is configured for transaction type '" & _
+            transType & "'. Add it on the Config sheet."
+    End If
+    If Not FileExists(tplPath) Then
+        Err.Raise ERR_BASE + 102, "ScanTemplateAndBuild", _
+            "Template file was not found:" & vbCrLf & tplPath
+    End If
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Err.Raise ERR_BASE + 103, "ScanTemplateAndBuild", _
+            "No transaction sheet name is configured for '" & _
+            transType & "'. Add it on the Config sheet."
+    End If
+
+    '--- Open the template (read only, invisible) and harvest text.
+    On Error GoTo CleanFail
+    Set wdApp = NewWordApp()
+    wdApp.Visible = False
+    On Error Resume Next
+    wdApp.DisplayAlerts = 0          ' wdAlertsNone
+    On Error GoTo CleanFail
+
+    Set wdDoc = wdApp.Documents.Open(FileName:=tplPath, _
+                                     ReadOnly:=True, _
+                                     AddToRecentFiles:=False, _
+                                     Visible:=False)
+
+    fullText = CollectTemplateText(wdDoc)
+
+    wdDoc.Close SaveChanges:=False   ' wdDoNotSaveChanges
+    Set wdDoc = Nothing
+    wdApp.Quit
+    Set wdApp = Nothing
+
+    '--- Parse and persist.
+    Set placeholders = NewDict()
+    Set sections = NewDict()
+    ParseTags fullText, placeholders, sections
+
+    WritePlaceholderSheet placeholders
+    WriteAltSheet sections
+
+    '--- Build the visible input sheet.
+    BuildTransactionSheet transType
+
+    Exit Sub
+
+CleanFail:
+    Dim em As String
+    em = Err.Description
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then wdApp.Quit
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    On Error GoTo 0
+    Err.Raise ERR_BASE + 104, "ScanTemplateAndBuild", em
+End Sub
+
+'-----------------------------------------------------------------
+' Concatenates text from every story range in the document so the
+' tag parser sees a single string covering body, tables, headers,
+' footers, textboxes and shapes.
+'-----------------------------------------------------------------
+Public Function CollectTemplateText(ByVal wdDoc As Object) As String
+    Dim sb As String
+    Dim st As Object
+    Dim shp As Object
+    Dim sec As Object
+    Dim i As Long
+
+    '--- All story ranges (body + linked text box / footnote stories).
+    On Error Resume Next
+    Set st = wdDoc.StoryRanges.Item(1)   ' wdMainTextStory baseline
+    On Error GoTo 0
+
+    Dim story As Object
+    For Each story In wdDoc.StoryRanges
+        Set st = story
+        Do While Not st Is Nothing
+            sb = sb & st.Text & vbCrLf
+            Set st = st.NextStoryRange
+        Loop
+    Next story
+
+    '--- Shapes anchored in the body (text boxes etc.).
+    On Error Resume Next
+    For Each shp In wdDoc.Shapes
+        If shp.TextFrame.HasText Then
+            sb = sb & shp.TextFrame.TextRange.Text & vbCrLf
+        End If
+    Next shp
+    On Error GoTo 0
+
+    '--- Per-section headers and footers (primary / first / even) and
+    '    any shapes living inside them.
+    For Each sec In wdDoc.Sections
+        sb = sb & HeaderFooterText(sec)
+    Next sec
+
+    CollectTemplateText = sb
+End Function
+
+'-----------------------------------------------------------------
+' Returns concatenated text of all header and footer variants for a
+' section, including shapes inside those headers/footers.
+'-----------------------------------------------------------------
+Private Function HeaderFooterText(ByVal sec As Object) As String
+    Dim sb As String
+    Dim idx As Long
+    Dim hf As Object
+    Dim shp As Object
+
+    On Error Resume Next
+    ' Indices 1..3 == primary, first page, even page.
+    For idx = 1 To 3
+        Set hf = sec.Headers.Item(idx)
+        If Not hf Is Nothing Then
+            If hf.Exists Then
+                sb = sb & hf.Range.Text & vbCrLf
+                For Each shp In hf.Shapes
+                    If shp.TextFrame.HasText Then
+                        sb = sb & shp.TextFrame.TextRange.Text & vbCrLf
+                    End If
+                Next shp
+            End If
+        End If
+
+        Set hf = sec.Footers.Item(idx)
+        If Not hf Is Nothing Then
+            If hf.Exists Then
+                sb = sb & hf.Range.Text & vbCrLf
+                For Each shp In hf.Shapes
+                    If shp.TextFrame.HasText Then
+                        sb = sb & shp.TextFrame.TextRange.Text & vbCrLf
+                    End If
+                Next shp
+            End If
+        End If
+    Next idx
+    On Error GoTo 0
+
+    HeaderFooterText = sb
+End Function
+
+'-----------------------------------------------------------------
+' Parses all <<...>> tags out of text.
+'   - Tags beginning ALT_ are classified into ALT sections.
+'   - Everything else is a placeholder.
+' placeholders : Dictionary populated with name -> True (deduped).
+' sections     : Dictionary populated with section -> clsAltSection.
+'-----------------------------------------------------------------
+Public Sub ParseTags(ByVal text As String, _
+                     ByRef placeholders As Object, _
+                     ByRef sections As Object)
+    Dim re As Object, matches As Object, m As Object
+    Dim inner As String
+
+    Dim startKeys As Object, endKeys As Object
+    Set startKeys = NewDict()
+    Set endKeys = NewDict()
+
+    Set re = NewRegExp()
+    re.Global = True
+    re.IgnoreCase = False
+    re.MultiLine = True
+    re.Pattern = "<<([^<>]+?)>>"
+
+    Set matches = re.Execute(text)
+    For Each m In matches
+        inner = Trim$(m.SubMatches(0))
+        If Len(inner) = 0 Then GoTo NextMatch
+
+        If Left$(inner, 4) = "ALT_" Then
+            ClassifyAltTag inner, sections, startKeys, endKeys
+        Else
+            If Not placeholders.Exists(inner) Then placeholders.Add inner, True
+        End If
+NextMatch:
+    Next m
+
+    ValidateAltPairing startKeys, endKeys
+End Sub
+
+'-----------------------------------------------------------------
+' Classifies a single ALT tag inner-string (already stripped of <<>>).
+' Expected forms:
+'   ALT_<Section>_<Option>_START
+'   ALT_<Section>_<Option>_END
+' The Section is the text before the first underscore of the remainder
+' after "ALT_"; the Option is everything between that and the _START/
+' _END suffix. The real full key (Section_Option) is recorded on the
+' section object exactly as derived.
+'-----------------------------------------------------------------
+Private Sub ClassifyAltTag(ByVal inner As String, _
+                           ByRef sections As Object, _
+                           ByRef startKeys As Object, _
+                           ByRef endKeys As Object)
+    Dim body As String
+    Dim isStart As Boolean, isEnd As Boolean
+    Dim fullKey As String
+    Dim sectionName As String
+    Dim sec As clsAltSection
+
+    body = Mid$(inner, 5)            ' drop leading "ALT_"
+
+    If Right$(body, 6) = "_START" Then
+        isStart = True
+        fullKey = Left$(body, Len(body) - 6)
+    ElseIf Right$(body, 4) = "_END" Then
+        isEnd = True
+        fullKey = Left$(body, Len(body) - 4)
+    Else
+        ' Not a well-formed START/END marker: ignore quietly.
+        Exit Sub
+    End If
+
+    If Len(fullKey) = 0 Then Exit Sub
+
+    sectionName = SectionFromKey(fullKey)
+
+    If sections.Exists(sectionName) Then
+        Set sec = sections.Item(sectionName)
+    Else
+        Set sec = New clsAltSection
+        sec.SectionName = sectionName
+        sections.Add sectionName, sec
+    End If
+    sec.AddKey fullKey
+
+    If isStart Then
+        If Not startKeys.Exists(fullKey) Then startKeys.Add fullKey, True
+    ElseIf isEnd Then
+        If Not endKeys.Exists(fullKey) Then endKeys.Add fullKey, True
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Non-fatal validation that every START has an END and vice versa.
+' Broken structures are surfaced to the user but do not abort the
+' load, so they can still inspect and fix the template.
+'-----------------------------------------------------------------
+Private Sub ValidateAltPairing(ByVal startKeys As Object, _
+                               ByVal endKeys As Object)
+    Dim k As Variant, missing As String
+
+    For Each k In startKeys.Keys
+        If Not endKeys.Exists(k) Then
+            missing = missing & " - <<ALT_" & k & "_START>> has no matching _END" & vbCrLf
+        End If
+    Next k
+    For Each k In endKeys.Keys
+        If Not startKeys.Exists(k) Then
+            missing = missing & " - <<ALT_" & k & "_END>> has no matching _START" & vbCrLf
+        End If
+    Next k
+
+    If Len(missing) > 0 Then
+        MsgBox "Warning: the template has unbalanced ALT markers." & vbCrLf & vbCrLf & _
+               missing & vbCrLf & _
+               "These sections may not behave correctly. You can still " & _
+               "continue, but consider fixing the template.", _
+               vbExclamation, "ALT structure check"
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Writes the deduped placeholder names into the very-hidden
+' wPlaceholders sheet (one name per row in column A from row 2).
+'-----------------------------------------------------------------
+Public Sub WritePlaceholderSheet(ByVal placeholders As Object)
+    Dim ws As Worksheet, r As Long, k As Variant
+    Set ws = EnsureSheet(SHEET_PLACEHLDR, False)
+    ws.Cells.Clear
+    ws.Range("A1").Value = "PlaceholderName"
+
+    r = 2
+    For Each k In placeholders.Keys
+        ws.Cells(r, 1).Value = CStr(k)
+        r = r + 1
+    Next k
+End Sub
+
+'-----------------------------------------------------------------
+' Writes ALT sections into the very-hidden wAlt sheet:
+'   A = Section, B = Option label, C = real full key.
+' One row per option key. Used to build dropdowns and to drive block
+' keep/delete during generation.
+'-----------------------------------------------------------------
+Public Sub WriteAltSheet(ByVal sections As Object)
+    Dim ws As Worksheet, r As Long
+    Dim secKey As Variant, keyVar As Variant
+    Dim sec As clsAltSection
+    Dim fullKey As String
+
+    Set ws = EnsureSheet(SHEET_ALT, False)
+    ws.Cells.Clear
+    ws.Range("A1").Value = "Section"
+    ws.Range("B1").Value = "OptionLabel"
+    ws.Range("C1").Value = "FullKey"
+
+    r = 2
+    For Each secKey In sections.Keys
+        Set sec = sections.Item(secKey)
+        For Each keyVar In sec.Keys
+            fullKey = CStr(keyVar)
+            ws.Cells(r, 1).Value = sec.SectionName
+            ws.Cells(r, 2).Value = OptionLabelFromKey(fullKey)
+            ws.Cells(r, 3).Value = fullKey
+            r = r + 1
+        Next keyVar
+    Next secKey
+End Sub
+```
+
+### `modUI` — Standard module
+
+*Builds the transaction input sheet and reads entries back.*
+
+```vba
+Attribute VB_Name = "modUI"
+'=================================================================
+' modUI
+' Builds the visible transaction input sheet from the working sheets
+' (placeholder list + ALT list) and reads the user's entries back.
+'
+' The BUILD layout and the READ layout share the same constants so
+' the two can never drift apart.
+'=================================================================
+Option Explicit
+
+'--- Transaction-sheet layout constants -----------------------------
+Public Const TS_TITLE_CELL    As String = "B1"
+
+Public Const TS_PH_HEADER_ROW As Long = 3
+Public Const TS_PH_FIELD_COL  As Long = 2     ' column B : field name
+Public Const TS_PH_VALUE_COL  As Long = 3     ' column C : value entry
+
+Public Const TS_ALT_HEADER_ROW As Long = 3
+Public Const TS_ALT_SEC_COL    As Long = 5    ' column E : section
+Public Const TS_ALT_SEL_COL    As Long = 6    ' column F : selection
+
+Public Const TS_FIRST_DATA_ROW As Long = 4    ' first row beneath headers
+
+Public Const ALT_NONE As String = "None"
+
+'-----------------------------------------------------------------
+' Builds (or rebuilds) the visible transaction sheet for a type:
+'   - placeholder fields (excluding master fields) down column B/C
+'   - ALT section dropdowns down column E/F
+'-----------------------------------------------------------------
+Public Sub BuildTransactionSheet(ByVal transType As String)
+    Dim sheetName As String
+    Dim ws As Worksheet
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Err.Raise ERR_BASE + 201, "BuildTransactionSheet", _
+            "No transaction sheet configured for '" & transType & "'."
+    End If
+
+    Set ws = EnsureSheet(sheetName, True)
+    ws.Cells.Clear
+    ClearValidation ws
+
+    '--- Title.
+    ws.Range(TS_TITLE_CELL).Value = transType & " — Transaction Inputs"
+    ws.Range(TS_TITLE_CELL).Font.Bold = True
+    ws.Range(TS_TITLE_CELL).Font.Size = 14
+
+    BuildPlaceholderTable ws
+    BuildAltDropdowns ws
+
+    ws.Columns("B:F").AutoFit
+    On Error Resume Next
+    ws.Columns("C").ColumnWidth = 40
+    ws.Columns("F").ColumnWidth = 24
+    On Error GoTo 0
+
+    ShowTransactionSheet transType
+End Sub
+
+'-----------------------------------------------------------------
+' Lays out the placeholder field/value table on a sheet, skipping any
+' placeholder whose name matches a master field (case-insensitive),
+' so master inputs are never duplicated on the transaction sheet.
+'-----------------------------------------------------------------
+Private Sub BuildPlaceholderTable(ByVal ws As Worksheet)
+    Dim src As Worksheet
+    Dim masterNames As Object
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim nm As String
+
+    '--- Header.
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_FIELD_COL).Value = "Field"
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_VALUE_COL).Value = "Value"
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_FIELD_COL).Font.Bold = True
+    ws.Cells(TS_PH_HEADER_ROW, TS_PH_VALUE_COL).Font.Bold = True
+
+    If Not SheetExists(SHEET_PLACEHLDR) Then Exit Sub
+    Set src = ThisWorkbook.Worksheets(SHEET_PLACEHLDR)
+    Set masterNames = GetMasterFieldNames()
+
+    lastRow = LastRowIn(src, 1, 2)
+    outRow = TS_FIRST_DATA_ROW
+
+    For r = 2 To lastRow
+        nm = Trim$(CStr(src.Cells(r, 1).Value))
+        If Len(nm) > 0 Then
+            If Not masterNames.Exists(nm) Then
+                ws.Cells(outRow, TS_PH_FIELD_COL).Value = nm
+                ' Light visual cue for the editable value cell.
+                ws.Cells(outRow, TS_PH_VALUE_COL).Interior.Color = RGB(255, 255, 204)
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+
+    If outRow = TS_FIRST_DATA_ROW Then
+        ws.Cells(TS_FIRST_DATA_ROW, TS_PH_FIELD_COL).Value = _
+            "(no transaction-specific fields in this template)"
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Builds one dropdown per ALT section in column E/F. Options are the
+' section's option labels in first-seen order, with "None" appended.
+' Default selection is "None".
+'-----------------------------------------------------------------
+Private Sub BuildAltDropdowns(ByVal ws As Worksheet)
+    Dim src As Worksheet
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim sectionsSeen As Object         ' section -> row written
+    Dim optionLists As Object          ' section -> comma list of labels
+    Dim secName As String, optLabel As String
+    Dim listText As String
+    Dim k As Variant
+
+    '--- Header.
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEC_COL).Value = "Optional Section"
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEL_COL).Value = "Selection"
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEC_COL).Font.Bold = True
+    ws.Cells(TS_ALT_HEADER_ROW, TS_ALT_SEL_COL).Font.Bold = True
+
+    If Not SheetExists(SHEET_ALT) Then Exit Sub
+    Set src = ThisWorkbook.Worksheets(SHEET_ALT)
+
+    Set sectionsSeen = NewDict()
+    sectionsSeen.CompareMode = 1
+    Set optionLists = NewDict()
+    optionLists.CompareMode = 1
+
+    '--- Accumulate option labels per section in first-seen order.
+    Dim order As Collection
+    Set order = New Collection
+    lastRow = LastRowIn(src, 1, 2)
+
+    For r = 2 To lastRow
+        secName = Trim$(CStr(src.Cells(r, 1).Value))
+        optLabel = Trim$(CStr(src.Cells(r, 2).Value))
+        If Len(secName) > 0 Then
+            If Not optionLists.Exists(secName) Then
+                optionLists.Add secName, optLabel
+                order.Add secName
+            Else
+                optionLists.Item(secName) = optionLists.Item(secName) & "," & optLabel
+            End If
+        End If
+    Next r
+
+    '--- Write one dropdown row per section.
+    outRow = TS_FIRST_DATA_ROW
+    For Each k In order
+        secName = CStr(k)
+        listText = optionLists.Item(secName) & "," & ALT_NONE
+
+        ws.Cells(outRow, TS_ALT_SEC_COL).Value = secName
+        ApplyListValidation ws.Cells(outRow, TS_ALT_SEL_COL), listText
+        ws.Cells(outRow, TS_ALT_SEL_COL).Value = ALT_NONE
+        ws.Cells(outRow, TS_ALT_SEL_COL).Interior.Color = RGB(220, 230, 241)
+
+        outRow = outRow + 1
+    Next k
+
+    If outRow = TS_FIRST_DATA_ROW Then
+        ws.Cells(TS_FIRST_DATA_ROW, TS_ALT_SEC_COL).Value = _
+            "(no optional sections in this template)"
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Applies an in-cell list validation. Excel limits the inline list
+' source to ~255 characters; if the list is longer we fall back to a
+' free-text cell rather than failing the whole build.
+'-----------------------------------------------------------------
+Private Sub ApplyListValidation(ByVal target As Range, ByVal listText As String)
+    On Error GoTo FreeText
+    With target.Validation
+        .Delete
+        If Len(listText) <= 255 Then
+            .Add Type:=xlValidateList, _
+                 AlertStyle:=xlValidAlertStop, _
+                 Operator:=xlBetween, _
+                 Formula1:=listText
+            .IgnoreBlank = True
+            .InCellDropdown = True
+        End If
+    End With
+    Exit Sub
+FreeText:
+    ' Leave the cell as plain free-text entry.
+    On Error Resume Next
+    target.Validation.Delete
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' Removes all data validation from a worksheet (used before rebuild).
+'-----------------------------------------------------------------
+Private Sub ClearValidation(ByVal ws As Worksheet)
+    On Error Resume Next
+    ws.Cells.Validation.Delete
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' Reads transaction-specific field values from the visible sheet into
+' a Dictionary of field name -> value. Note rows (field text wrapped
+' in parentheses) are skipped.
+'-----------------------------------------------------------------
+Public Function ReadTransactionInputs(ByVal transType As String) As Object
+    Dim d As Object, ws As Worksheet
+    Dim sheetName As String
+    Dim lastRow As Long, r As Long
+    Dim nm As String, val As String
+
+    Set d = NewDict()
+    d.CompareMode = 1
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Set ReadTransactionInputs = d
+        Exit Function
+    End If
+    If Not SheetExists(sheetName) Then
+        Set ReadTransactionInputs = d
+        Exit Function
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    lastRow = LastRowIn(ws, TS_PH_FIELD_COL, TS_FIRST_DATA_ROW)
+
+    For r = TS_FIRST_DATA_ROW To lastRow
+        nm = Trim$(CStr(ws.Cells(r, TS_PH_FIELD_COL).Value))
+        If Len(nm) > 0 Then
+            If Left$(nm, 1) <> "(" Then         ' skip note rows
+                val = CStr(ws.Cells(r, TS_PH_VALUE_COL).Value)
+                If Not d.Exists(nm) Then d.Add nm, val
+            End If
+        End If
+    Next r
+
+    Set ReadTransactionInputs = d
+End Function
+
+'-----------------------------------------------------------------
+' Reads ALT section selections from the visible sheet into a
+' Dictionary of section -> selection. A blank cell is treated as None.
+'-----------------------------------------------------------------
+Public Function ReadAltSelections(ByVal transType As String) As Object
+    Dim d As Object, ws As Worksheet
+    Dim sheetName As String
+    Dim lastRow As Long, r As Long
+    Dim secName As String, sel As String
+
+    Set d = NewDict()
+    d.CompareMode = 1
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Set ReadAltSelections = d
+        Exit Function
+    End If
+    If Not SheetExists(sheetName) Then
+        Set ReadAltSelections = d
+        Exit Function
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    lastRow = LastRowIn(ws, TS_ALT_SEC_COL, TS_FIRST_DATA_ROW)
+
+    For r = TS_FIRST_DATA_ROW To lastRow
+        secName = Trim$(CStr(ws.Cells(r, TS_ALT_SEC_COL).Value))
+        If Len(secName) > 0 Then
+            If Left$(secName, 1) <> "(" Then
+                sel = Trim$(CStr(ws.Cells(r, TS_ALT_SEL_COL).Value))
+                If Len(sel) = 0 Then sel = ALT_NONE
+                If Not d.Exists(secName) Then d.Add secName, sel
+            End If
+        End If
+    Next r
+
+    Set ReadAltSelections = d
+End Function
+
+'-----------------------------------------------------------------
+' Shows the transaction sheet for a type and hides the OTHER
+' transaction sheets listed in Config to keep the workbook tidy.
+'-----------------------------------------------------------------
+Public Sub ShowTransactionSheet(ByVal transType As String)
+    Dim sheetName As String
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then Exit Sub
+
+    HideOtherTransactionSheets sheetName
+
+    If SheetExists(sheetName) Then
+        With ThisWorkbook.Worksheets(sheetName)
+            .Visible = xlSheetVisible
+            .Activate
+        End With
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Hides every Config-listed transaction sheet except keepName.
+'-----------------------------------------------------------------
+Public Sub HideOtherTransactionSheets(ByVal keepName As String)
+    Dim rng As Range, r As Long, nm As String
+    Set rng = ConfigData()
+    If rng Is Nothing Then Exit Sub
+
+    For r = 1 To rng.Rows.Count
+        nm = Trim$(CStr(rng.Cells(r, CFG_COL_SHEET).Value))
+        If Len(nm) = 0 Then
+            If Len(Trim$(CStr(rng.Cells(r, CFG_COL_TYPE).Value))) = 0 Then Exit For
+        Else
+            If StrComp(nm, keepName, vbTextCompare) <> 0 Then
+                If SheetExists(nm) Then
+                    On Error Resume Next
+                    ThisWorkbook.Worksheets(nm).Visible = xlSheetHidden
+                    On Error GoTo 0
+                End If
+            End If
+        End If
+    Next r
+End Sub
+```
+
+### `modWordGen` — Standard module
+
+*The late-bound Word generation engine.*
+
+```vba
+Attribute VB_Name = "modWordGen"
+'=================================================================
+' modWordGen
+' The document generation engine. Everything here is LATE BOUND.
+'
+' Pipeline (order matters):
+'   1. Copy the template to a working file in TEMP (original untouched).
+'   2. Open the working copy invisibly.
+'   3. Process ALT sections   (keep one option, delete the rest).
+'   4. Replace all placeholders everywhere.
+'   5. Clean up excessive blank paragraphs.
+'   6. Scan for any unresolved <<...>> tags.
+'   7. SaveAs the output .docx, delete the working copy, show Word.
+'=================================================================
+Option Explicit
+
+'--- Late-binding numeric constants (no Word reference available) ---
+Private Const wdDoNotSaveChanges As Long = 0
+Private Const wdFindStop         As Long = 0
+Private Const wdCollapseEnd      As Long = 0
+Private Const wdFormatXMLDocument As Long = 12
+Private Const wdReplaceAll       As Long = 2
+Private Const wdAlertsNone       As Long = 0
+
+'-----------------------------------------------------------------
+' Main entry. Returns True on success. Fills 'unresolved' with any
+' placeholder tags still present after processing.
+'-----------------------------------------------------------------
+Public Function BuildWordDocument(ByVal templatePath As String, _
+                                  ByVal data As Object, _
+                                  ByVal altSel As Object, _
+                                  ByVal outputPath As String, _
+                                  ByRef unresolved As Collection) As Boolean
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Dim workingCopy As String
+
+    BuildWordDocument = False
+    Set unresolved = New Collection
+
+    If Not FileExists(templatePath) Then
+        Err.Raise ERR_BASE + 1201, "BuildWordDocument", _
+            "Template not found:" & vbCrLf & templatePath
+    End If
+
+    '--- Make a private working copy so the original is never opened
+    '    for edit.
+    Randomize
+    workingCopy = TempFolderPath() & "\VZ_work_" & _
+                  Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+                  CStr(Int(Rnd * 100000)) & ".docx"
+
+    On Error GoTo CleanFail
+    SafeKill workingCopy
+    FileCopy templatePath, workingCopy
+
+    Set wdApp = NewWordApp()
+    wdApp.Visible = False
+    On Error Resume Next
+    wdApp.DisplayAlerts = wdAlertsNone
+    On Error GoTo CleanFail
+
+    Set wdDoc = wdApp.Documents.Open(FileName:=workingCopy, _
+                                     ReadOnly:=False, _
+                                     AddToRecentFiles:=False, _
+                                     Visible:=False)
+
+    '--- 3) ALT first, so kept blocks still get placeholder replacement
+    '       and deleted blocks contribute nothing to the unresolved scan.
+    ProcessAltSections wdDoc, altSel
+
+    '--- 4) Replace every placeholder across every story range.
+    ReplaceAllPlaceholders wdDoc, data
+
+    '--- 5) Tidy whitespace left behind by deleted blocks.
+    CleanupBlankParagraphs wdDoc
+
+    '--- 6) Report anything still unresolved.
+    ScanUnresolved wdDoc, unresolved
+
+    '--- 7) Save final output, drop the working copy, reveal Word.
+    SafeKill outputPath
+    wdDoc.SaveAs2 FileName:=outputPath, FileFormat:=wdFormatXMLDocument
+    ' wdDoc now points at outputPath, so the working copy is free.
+    SafeKill workingCopy
+
+    wdApp.Visible = True
+    On Error Resume Next
+    wdApp.Activate
+    wdDoc.Activate
+    AppActivate wdApp.Caption
+    On Error GoTo 0
+
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    BuildWordDocument = True
+    Exit Function
+
+CleanFail:
+    Dim em As String
+    em = Err.Description
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close wdDoNotSaveChanges
+    If Not wdApp Is Nothing Then wdApp.Quit
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    SafeKill workingCopy
+    On Error GoTo 0
+    Err.Raise ERR_BASE + 1209, "BuildWordDocument", em
+End Function
+
+'-----------------------------------------------------------------
+' Processes ALT sections against the user's selections (read from the
+' wAlt working sheet). For each option key:
+'   - if its section's selection matches this option's label -> KEEP
+'     (strip the START and END markers, keep the content between),
+'   - otherwise -> DELETE the whole block including its markers.
+' A selection of "None" (or a section with no matching option) deletes
+' every block for that section.
+'-----------------------------------------------------------------
+Public Sub ProcessAltSections(ByVal wdDoc As Object, ByVal altSel As Object)
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim secName As String, optLabel As String, fullKey As String
+    Dim chosen As String
+    Dim startTag As String, endTag As String
+
+    If Not SheetExists(SHEET_ALT) Then Exit Sub
+    Set ws = ThisWorkbook.Worksheets(SHEET_ALT)
+    lastRow = LastRowIn(ws, 1, 2)
+
+    For r = 2 To lastRow
+        secName = Trim$(CStr(ws.Cells(r, 1).Value))
+        optLabel = Trim$(CStr(ws.Cells(r, 2).Value))
+        fullKey = Trim$(CStr(ws.Cells(r, 3).Value))
+        If Len(fullKey) = 0 Then GoTo NextRow
+
+        If altSel.Exists(secName) Then
+            chosen = CStr(altSel.Item(secName))
+        Else
+            chosen = ALT_NONE
+        End If
+
+        startTag = "<<ALT_" & fullKey & "_START>>"
+        endTag = "<<ALT_" & fullKey & "_END>>"
+
+        If StrComp(chosen, ALT_NONE, vbTextCompare) <> 0 _
+           And StrComp(chosen, optLabel, vbTextCompare) = 0 Then
+            ' KEEP this block: remove only the two markers.
+            RemoveMarkersEverywhere wdDoc, startTag, endTag
+        Else
+            ' DELETE this block, markers and content.
+            DeleteBlockEverywhere wdDoc, startTag, endTag
+        End If
+NextRow:
+    Next r
+End Sub
+
+'-----------------------------------------------------------------
+' Removes a START and an END marker (keeping the text between them)
+' from every story range in the document.
+'-----------------------------------------------------------------
+Private Sub RemoveMarkersEverywhere(ByVal wdDoc As Object, _
+                                    ByVal startTag As String, _
+                                    ByVal endTag As String)
+    Dim ranges As Collection, i As Long, rng As Object
+    Set ranges = GetProcessRanges(wdDoc)
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        ReplaceTextInRange rng, startTag, ""
+        ReplaceTextInRange rng, endTag, ""
+    Next i
+End Sub
+
+'-----------------------------------------------------------------
+' Deletes the entire span from a START marker to its END marker
+' (inclusive) from every story range in the document.
+'-----------------------------------------------------------------
+Private Sub DeleteBlockEverywhere(ByVal wdDoc As Object, _
+                                  ByVal startTag As String, _
+                                  ByVal endTag As String)
+    Dim ranges As Collection, i As Long, rng As Object
+    Set ranges = GetProcessRanges(wdDoc)
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        DeleteBetweenTagsInRange rng, startTag, endTag
+    Next i
+End Sub
+
+'-----------------------------------------------------------------
+' Within a single range, repeatedly finds startTag, then endTag after
+' it, and deletes everything from the start of startTag to the end of
+' endTag. Stops if a START has no following END (and warns once via
+' the caller's validation; here we just stop to stay safe).
+'-----------------------------------------------------------------
+Private Sub DeleteBetweenTagsInRange(ByVal rng As Object, _
+                                     ByVal startTag As String, _
+                                     ByVal endTag As String)
+    Dim docObj As Object
+    Dim fStart As Object, fEnd As Object
+    Dim guard As Long
+
+    Set docObj = rng.Document
+
+    Do
+        guard = guard + 1
+        If guard > 500 Then Exit Do
+
+        '--- Find the START marker within the range.
+        Set fStart = rng.Duplicate
+        fStart.Find.ClearFormatting
+        With fStart.Find
+            .Text = startTag
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchCase = True
+            .MatchWildcards = False
+            .Format = False
+        End With
+        If Not fStart.Find.Execute Then Exit Do
+
+        '--- Find the END marker after the START.
+        Set fEnd = docObj.Range(fStart.End, rng.End)
+        fEnd.Find.ClearFormatting
+        With fEnd.Find
+            .Text = endTag
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchCase = True
+            .MatchWildcards = False
+            .Format = False
+        End With
+        If Not fEnd.Find.Execute Then Exit Do   ' missing END: stop safely
+
+        '--- Delete the whole span, markers included.
+        Dim span As Object
+        Set span = docObj.Range(fStart.Start, fEnd.End)
+        span.Delete
+    Loop
+End Sub
+
+'-----------------------------------------------------------------
+' Replaces every placeholder (from the wPlaceholders working sheet)
+' with its value (from the data dictionary) across every story range.
+' Placeholders with no supplied value become empty string.
+'-----------------------------------------------------------------
+Public Sub ReplaceAllPlaceholders(ByVal wdDoc As Object, ByVal data As Object)
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim nm As String, val As String
+    Dim ranges As Collection, i As Long, rng As Object
+
+    If Not SheetExists(SHEET_PLACEHLDR) Then Exit Sub
+    Set ws = ThisWorkbook.Worksheets(SHEET_PLACEHLDR)
+    lastRow = LastRowIn(ws, 1, 2)
+
+    Set ranges = GetProcessRanges(wdDoc)
+
+    For r = 2 To lastRow
+        nm = Trim$(CStr(ws.Cells(r, 1).Value))
+        If Len(nm) > 0 Then
+            If data.Exists(nm) Then
+                val = CStr(data.Item(nm))
+            Else
+                val = ""
+            End If
+            For i = 1 To ranges.Count
+                Set rng = ranges.Item(i)
+                ReplaceTextInRange rng, "<<" & nm & ">>", val
+            Next i
+        End If
+    Next r
+End Sub
+
+'-----------------------------------------------------------------
+' Core replace primitive. Replaces every occurrence of findText with
+' replaceText inside a single range, with NO 255-character limit on
+' the replacement (we set Range.Text directly rather than using
+' Find.Replacement.Text). Collapsing past the inserted text after
+' each hit prevents infinite loops when the replacement itself
+' contains the search text.
+'-----------------------------------------------------------------
+Public Sub ReplaceTextInRange(ByVal rng As Object, _
+                              ByVal findText As String, _
+                              ByVal replaceText As String)
+    Dim docObj As Object
+    Dim found As Object
+    Dim guard As Long
+
+    If Len(findText) = 0 Then Exit Sub
+    Set docObj = rng.Document
+
+    Set found = rng.Duplicate
+    found.Find.ClearFormatting
+    With found.Find
+        .Text = findText
+        .Forward = True
+        .Wrap = wdFindStop
+        .MatchCase = True
+        .MatchWildcards = False
+        .Format = False
+    End With
+
+    Do While found.Find.Execute
+        guard = guard + 1
+        If guard > 5000 Then Exit Do
+
+        ' Replace the found text by writing directly to the range.
+        found.Text = replaceText
+        ' Move past what we just inserted so we never re-match it.
+        found.Collapse wdCollapseEnd
+        found.End = rng.End
+
+        found.Find.ClearFormatting
+        With found.Find
+            .Text = findText
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchCase = True
+            .MatchWildcards = False
+            .Format = False
+        End With
+    Loop
+End Sub
+
+'-----------------------------------------------------------------
+' Builds a collection of EVERY range we must process: all story
+' ranges (with their NextStoryRange chains), body shapes, and each
+' section's three header and three footer variants plus shapes inside
+' them. Double coverage is harmless and idempotent.
+'-----------------------------------------------------------------
+Public Function GetProcessRanges(ByVal wdDoc As Object) As Collection
+    Dim col As New Collection
+    Dim story As Object, st As Object
+    Dim shp As Object, sec As Object
+    Dim hf As Object, idx As Long
+
+    '--- Story ranges and their continuation chains.
+    On Error Resume Next
+    For Each story In wdDoc.StoryRanges
+        Set st = story
+        Do While Not st Is Nothing
+            col.Add st
+            Set st = st.NextStoryRange
+        Loop
+    Next story
+    On Error GoTo 0
+
+    '--- Body shapes with text.
+    On Error Resume Next
+    For Each shp In wdDoc.Shapes
+        If shp.TextFrame.HasText Then
+            col.Add shp.TextFrame.TextRange
+        End If
+    Next shp
+    On Error GoTo 0
+
+    '--- Header/footer ranges (primary/first/even) and their shapes.
+    On Error Resume Next
+    For Each sec In wdDoc.Sections
+        For idx = 1 To 3
+            Set hf = sec.Headers.Item(idx)
+            If Not hf Is Nothing Then
+                If hf.Exists Then
+                    col.Add hf.Range
+                    For Each shp In hf.Shapes
+                        If shp.TextFrame.HasText Then col.Add shp.TextFrame.TextRange
+                    Next shp
+                End If
+            End If
+            Set hf = sec.Footers.Item(idx)
+            If Not hf Is Nothing Then
+                If hf.Exists Then
+                    col.Add hf.Range
+                    For Each shp In hf.Shapes
+                        If shp.TextFrame.HasText Then col.Add shp.TextFrame.TextRange
+                    Next shp
+                End If
+            End If
+        Next idx
+    Next sec
+    On Error GoTo 0
+
+    Set GetProcessRanges = col
+End Function
+
+'-----------------------------------------------------------------
+' Collapses runs of two or more consecutive empty paragraphs into a
+' single paragraph break, across every range. Heuristic (uses the
+' wildcard ^13{2,}), and fully guarded so it can never abort a run.
+'-----------------------------------------------------------------
+Public Sub CleanupBlankParagraphs(ByVal wdDoc As Object)
+    Dim ranges As Collection, i As Long, rng As Object
+    Set ranges = GetProcessRanges(wdDoc)
+
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        On Error Resume Next
+        With rng.Find
+            .ClearFormatting
+            .Replacement.ClearFormatting
+            .Text = "^13{2,}"
+            .Replacement.Text = "^p"
+            .Forward = True
+            .Wrap = wdFindStop
+            .MatchWildcards = True
+            .Execute Replace:=wdReplaceAll
+        End With
+        On Error GoTo 0
+    Next i
+End Sub
+
+'-----------------------------------------------------------------
+' Scans every range for any remaining <<...>> tags and adds the
+' deduped inner names to the 'unresolved' collection.
+'-----------------------------------------------------------------
+Public Sub ScanUnresolved(ByVal wdDoc As Object, ByRef unresolved As Collection)
+    Dim ranges As Collection, i As Long, rng As Object
+    Dim re As Object, matches As Object, m As Object
+    Dim seen As Object, inner As String
+
+    Set unresolved = New Collection
+    Set seen = NewDict()
+
+    Set re = NewRegExp()
+    re.Global = True
+    re.IgnoreCase = False
+    re.MultiLine = True
+    re.Pattern = "<<([^<>]+?)>>"
+
+    Set ranges = GetProcessRanges(wdDoc)
+    For i = 1 To ranges.Count
+        Set rng = ranges.Item(i)
+        Set matches = re.Execute(rng.Text)
+        For Each m In matches
+            inner = Trim$(m.SubMatches(0))
+            If Len(inner) > 0 Then
+                If Not seen.Exists(inner) Then
+                    seen.Add inner, True
+                    unresolved.Add inner
+                End If
+            End If
+        Next m
+    Next i
+End Sub
+```
+
+### `modMain` — Standard module
+
+*The two button macros.*
+
+```vba
+Attribute VB_Name = "modMain"
+'=================================================================
+' modMain
+' The two macros wired to the Dashboard buttons. These are the only
+' procedures the user ever triggers directly.
+'=================================================================
+Option Explicit
+
+'-----------------------------------------------------------------
+' Button: "Load Transaction"
+' Validates the selected type, scans its template, and builds the
+' transaction input sheet.
+'-----------------------------------------------------------------
+Public Sub LoadTransaction()
+    Dim transType As String
+
+    On Error GoTo Fail
+    Application.ScreenUpdating = False
+
+    transType = GetSelectedTransactionType()
+    If Len(transType) = 0 Then
+        MsgBox "Please select a Transaction Type first.", _
+               vbExclamation, "Load Transaction"
+        GoTo Done
+    End If
+
+    If GetConfigRowByType(transType) = 0 Then
+        MsgBox "Transaction Type '" & transType & "' is not listed on " & _
+               "the Config sheet.", vbExclamation, "Load Transaction"
+        GoTo Done
+    End If
+
+    SetStatus "Loading template for " & transType & "..."
+
+    ScanTemplateAndBuild transType
+
+    SetStatus "Loaded '" & transType & "'. Enter values, then click " & _
+              "Generate Document."
+
+Done:
+    Application.ScreenUpdating = True
+    Exit Sub
+
+Fail:
+    Application.ScreenUpdating = True
+    SetStatus "Load failed."
+    MsgBox "Could not load the transaction." & vbCrLf & vbCrLf & _
+           Err.Description, vbCritical, "Load Transaction"
+End Sub
+
+'-----------------------------------------------------------------
+' Button: "Generate Document"
+' Gathers master values + transaction inputs + ALT selections and
+' produces the final Word document. Warns on blank or unresolved
+' placeholders.
+'-----------------------------------------------------------------
+Public Sub GenerateDocument()
+    Dim transType As String
+    Dim tplPath As String
+    Dim sheetName As String
+    Dim data As Object
+    Dim altSel As Object
+    Dim outPath As String
+    Dim unresolved As Collection
+    Dim blanks As Collection
+    Dim ok As Boolean
+    Dim resp As VbMsgBoxResult
+
+    On Error GoTo Fail
+    Randomize
+
+    transType = GetSelectedTransactionType()
+    If Len(transType) = 0 Then
+        MsgBox "Please select a Transaction Type first.", _
+               vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+
+    If GetConfigRowByType(transType) = 0 Then
+        MsgBox "Transaction Type '" & transType & "' is not on the " & _
+               "Config sheet.", vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+
+    tplPath = GetResolvedTemplatePath(transType)
+    If Not FileExists(tplPath) Then
+        MsgBox "Template file not found:" & vbCrLf & tplPath, _
+               vbCritical, "Generate Document"
+        Exit Sub
+    End If
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Not SheetExists(sheetName) Then
+        MsgBox "The transaction sheet for '" & transType & "' does not " & _
+               "exist yet. Click Load Transaction first.", _
+               vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+    If Not SheetExists(SHEET_PLACEHLDR) Then
+        MsgBox "Template has not been scanned yet. Click Load " & _
+               "Transaction first.", vbExclamation, "Generate Document"
+        Exit Sub
+    End If
+
+    '--- Assemble inputs. Master values first; transaction inputs
+    '    exclude master fields by construction, so there is no clash.
+    Set data = GetMasterValues()
+    MergeInto data, ReadTransactionInputs(transType)
+    Set altSel = ReadAltSelections(transType)
+
+    '--- Warn (do not block) on blank values for fields the template
+    '    actually contains.
+    Set blanks = FindBlankPlaceholders(data)
+    If blanks.Count > 0 Then
+        resp = MsgBox("These fields are blank:" & vbCrLf & vbCrLf & _
+                      CollectionToText(blanks, vbCrLf) & vbCrLf & vbCrLf & _
+                      "Generate the document anyway?", _
+                      vbYesNo + vbQuestion, "Blank fields")
+        If resp <> vbYes Then
+            SetStatus "Generation cancelled."
+            Exit Sub
+        End If
+    End If
+
+    outPath = ThisWorkbook.Path & "\" & SanitizeFileName(transType) & _
+              "_" & Format$(Now, "yyyymmdd_hhnnss") & ".docx"
+
+    SetStatus "Generating document..."
+
+    ok = BuildWordDocument(tplPath, data, altSel, outPath, unresolved)
+
+    If ok Then
+        If Not unresolved Is Nothing Then
+            If unresolved.Count > 0 Then
+                MsgBox "Document generated, but some placeholders were " & _
+                       "left unresolved:" & vbCrLf & vbCrLf & _
+                       CollectionToText(unresolved, vbCrLf) & vbCrLf & vbCrLf & _
+                       "Saved to:" & vbCrLf & outPath, _
+                       vbExclamation, "Generated with warnings"
+                SetStatus "Generated with " & unresolved.Count & _
+                          " unresolved placeholder(s)."
+                Exit Sub
+            End If
+        End If
+        MsgBox "Document generated successfully." & vbCrLf & vbCrLf & _
+               "Saved to:" & vbCrLf & outPath, _
+               vbInformation, "Done"
+        SetStatus "Document generated."
+    Else
+        SetStatus "Generation failed."
+        MsgBox "Document generation did not complete.", _
+               vbCritical, "Generate Document"
+    End If
+    Exit Sub
+
+Fail:
+    SetStatus "Generation failed."
+    MsgBox "Could not generate the document." & vbCrLf & vbCrLf & _
+           Err.Description, vbCritical, "Generate Document"
+End Sub
+
+'-----------------------------------------------------------------
+' Copies all entries from src into dest (dest wins on key clash kept
+' as-is; here src overrides only when dest lacks the key, preserving
+' master values). Both are Dictionaries.
+'-----------------------------------------------------------------
+Private Sub MergeInto(ByVal dest As Object, ByVal src As Object)
+    Dim k As Variant
+    If src Is Nothing Then Exit Sub
+    For Each k In src.Keys
+        If Not dest.Exists(k) Then
+            dest.Add k, src.Item(k)
+        Else
+            dest.Item(k) = src.Item(k)
+        End If
+    Next k
+End Sub
+
+'-----------------------------------------------------------------
+' Returns the names of placeholders (present in the scanned template)
+' whose supplied value is blank, so the user can be warned.
+'-----------------------------------------------------------------
+Private Function FindBlankPlaceholders(ByVal data As Object) As Collection
+    Dim col As New Collection
+    Dim ws As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim nm As String, val As String
+
+    If Not SheetExists(SHEET_PLACEHLDR) Then
+        Set FindBlankPlaceholders = col
+        Exit Function
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_PLACEHLDR)
+    lastRow = LastRowIn(ws, 1, 2)
+
+    For r = 2 To lastRow
+        nm = Trim$(CStr(ws.Cells(r, 1).Value))
+        If Len(nm) > 0 Then
+            If data.Exists(nm) Then
+                val = CStr(data.Item(nm))
+            Else
+                val = ""
+            End If
+            If Len(Trim$(val)) = 0 Then col.Add nm
+        End If
+    Next r
+
+    Set FindBlankPlaceholders = col
+End Function
+
+'-----------------------------------------------------------------
+' Makes a string safe to use as a Windows file name.
+'-----------------------------------------------------------------
+Public Function SanitizeFileName(ByVal s As String) As String
+    Dim bad As Variant, i As Long, out As String
+    out = s
+    bad = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(bad) To UBound(bad)
+        out = Replace(out, CStr(bad(i)), "_")
+    Next i
+    out = Trim$(out)
+    If Len(out) = 0 Then out = "Document"
+    SanitizeFileName = out
+End Function
+```
+
+### `modSetup` — Standard module
+
+*One-click workbook bootstrap.*
+
+```vba
+Attribute VB_Name = "modSetup"
+'=================================================================
+' modSetup
+' One-click bootstrap. Run SetupWorkbook ONCE in a blank workbook and
+' it builds every sheet, named range, validation rule and button the
+' platform needs. Safe to re-run (it rebuilds in place).
+'
+' Excel's own object model (Worksheet, Range, Buttons, Validation,
+' RGB, the xl* constants) is intrinsically available to VBA, so this
+' module needs no project references. "Late binding / no references"
+' only concerns Word and the Scripting runtime, handled elsewhere.
+'=================================================================
+Option Explicit
+
+Public Sub SetupWorkbook()
+    Dim resp As VbMsgBoxResult
+    resp = MsgBox("This will build (or rebuild) the Dashboard, Config " & _
+                  "and working sheets, named ranges, dropdowns and " & _
+                  "buttons in THIS workbook." & vbCrLf & vbCrLf & _
+                  "Continue?", vbYesNo + vbQuestion, "Vinzor DocGen Setup")
+    If resp <> vbYes Then Exit Sub
+
+    Application.ScreenUpdating = False
+    On Error GoTo Fail
+
+    '--- Sheets.
+    EnsureSheet SHEET_DASHBOARD, True
+    EnsureSheet SHEET_CONFIG, True            ' visible; user may hide later
+    EnsureSheet SHEET_PLACEHLDR, False        ' very hidden working sheet
+    EnsureSheet SHEET_ALT, False              ' very hidden working sheet
+
+    BuildConfigSheet
+    BuildDashboardSheet
+    DefineNames
+    AddTransactionTypeValidation
+    AddButtons
+
+    ThisWorkbook.Worksheets(SHEET_DASHBOARD).Activate
+
+    Application.ScreenUpdating = True
+    MsgBox "Setup complete." & vbCrLf & vbCrLf & _
+           "Next: put your .docx templates in a 'Templates' subfolder " & _
+           "next to this workbook (or edit the paths on the Config " & _
+           "sheet), then use the Dashboard.", _
+           vbInformation, "Vinzor DocGen Setup"
+    Exit Sub
+
+Fail:
+    Application.ScreenUpdating = True
+    MsgBox "Setup failed:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor DocGen Setup"
+End Sub
+
+'-----------------------------------------------------------------
+' Builds the Config sheet headers and a set of sample rows. Paths use
+' the {WB} token so they resolve next to the workbook regardless of
+' where it lives.
+'-----------------------------------------------------------------
+Private Sub BuildConfigSheet()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_CONFIG)
+    ws.Cells.Clear
+
+    ws.Range("A1").Value = "Transaction Type"
+    ws.Range("B1").Value = "Template Path"
+    ws.Range("C1").Value = "Transaction Sheet"
+    ws.Range("D1").Value = "Description"
+    ws.Range("A1:D1").Font.Bold = True
+
+    Dim rows As Variant
+    rows = Array( _
+        Array("GMRA Repo", "{WB}\Templates\GMRA_Template.docx", _
+              "Transaction_GMRA", "GMRA repo confirmation"), _
+        Array("ISDA Transaction", "{WB}\Templates\ISDA_Template.docx", _
+              "Transaction_ISDA", "ISDA transaction confirmation"), _
+        Array("Securities Lending", "{WB}\Templates\SLA_Template.docx", _
+              "Transaction_SLA", "Securities lending confirmation"), _
+        Array("Collateral Swap Single", "{WB}\Templates\CS_Single_Template.docx", _
+              "Transaction_CS_SINGLE", "Single-document collateral swap"), _
+        Array("Collateral Swap Dual", "{WB}\Templates\CS_Dual_Template.docx", _
+              "Transaction_CS_DUAL", "Dual-leg collateral swap") _
+    )
+
+    Dim i As Long, r As Long
+    For i = LBound(rows) To UBound(rows)
+        r = 2 + i
+        ws.Cells(r, 1).Value = rows(i)(0)
+        ws.Cells(r, 2).Value = rows(i)(1)
+        ws.Cells(r, 3).Value = rows(i)(2)
+        ws.Cells(r, 4).Value = rows(i)(3)
+    Next i
+
+    ws.Columns("A:D").AutoFit
+End Sub
+
+'-----------------------------------------------------------------
+' Builds the Dashboard: title, type selector, status line, and the
+' master input table with common fields.
+'-----------------------------------------------------------------
+Private Sub BuildDashboardSheet()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_DASHBOARD)
+    ws.Cells.Clear
+
+    ws.Range("B2").Value = "Vinzor — Document Generator"
+    ws.Range("B2").Font.Bold = True
+    ws.Range("B2").Font.Size = 16
+
+    ws.Range("B4").Value = "Transaction Type:"
+    ws.Range("B4").Font.Bold = True
+    ws.Range("C4").Interior.Color = RGB(255, 255, 204)
+    ws.Range("C4").Borders.LineStyle = xlContinuous
+
+    ws.Range("B6").Value = "Status:"
+    ws.Range("B6").Font.Bold = True
+    ws.Range("C6").Value = "Select a Transaction Type, then click Load Transaction."
+
+    ws.Range("B9").Value = "MASTER INPUTS (shared across all transaction types)"
+    ws.Range("B9").Font.Bold = True
+    ws.Range("B9").Font.Size = 12
+
+    ws.Range("B11").Value = "Field"
+    ws.Range("C11").Value = "Value"
+    ws.Range("B11:C11").Font.Bold = True
+
+    Dim masters As Variant
+    masters = Array("Counterparty", "TradeDate", "EffectiveDate", _
+                    "Currency", "NoticeEmail", "GoverningLaw")
+
+    Dim i As Long, r As Long
+    For i = LBound(masters) To UBound(masters)
+        r = 12 + i
+        ws.Cells(r, 2).Value = masters(i)
+        ws.Cells(r, 3).Interior.Color = RGB(255, 255, 204)
+        ws.Cells(r, 3).Borders.LineStyle = xlContinuous
+    Next i
+
+    ws.Columns("B").ColumnWidth = 22
+    ws.Columns("C").ColumnWidth = 40
+End Sub
+
+'-----------------------------------------------------------------
+' (Re)defines the workbook named ranges used throughout the project.
+'-----------------------------------------------------------------
+Private Sub DefineNames()
+    DeleteNameIfExists NR_TRANS_TYPE
+    DeleteNameIfExists NR_STATUS
+    DeleteNameIfExists NR_MASTER_TABLE
+    DeleteNameIfExists NR_CONFIG_TABLE
+
+    ThisWorkbook.Names.Add Name:=NR_TRANS_TYPE, _
+        RefersTo:="=" & SHEET_DASHBOARD & "!$C$4"
+    ThisWorkbook.Names.Add Name:=NR_STATUS, _
+        RefersTo:="=" & SHEET_DASHBOARD & "!$C$6"
+    ThisWorkbook.Names.Add Name:=NR_MASTER_TABLE, _
+        RefersTo:="=" & SHEET_DASHBOARD & "!$B$12:$C$60"
+    ThisWorkbook.Names.Add Name:=NR_CONFIG_TABLE, _
+        RefersTo:="=" & SHEET_CONFIG & "!$A$2:$D$200"
+End Sub
+
+Private Sub DeleteNameIfExists(ByVal nm As String)
+    On Error Resume Next
+    ThisWorkbook.Names(nm).Delete
+    On Error GoTo 0
+End Sub
+
+'-----------------------------------------------------------------
+' Adds the Transaction Type dropdown on the Dashboard, sourced from
+' the Config type column.
+'-----------------------------------------------------------------
+Private Sub AddTransactionTypeValidation()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_DASHBOARD)
+
+    On Error Resume Next
+    ws.Range("C4").Validation.Delete
+    On Error GoTo 0
+
+    With ws.Range("C4").Validation
+        .Add Type:=xlValidateList, _
+             AlertStyle:=xlValidAlertStop, _
+             Operator:=xlBetween, _
+             Formula1:="=" & SHEET_CONFIG & "!$A$2:$A$200"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+    End With
+End Sub
+
+'-----------------------------------------------------------------
+' Adds the two Form-control buttons to the Dashboard and wires them to
+' their macros. Existing copies are removed first so re-running setup
+' does not stack duplicates.
+'-----------------------------------------------------------------
+Private Sub AddButtons()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_DASHBOARD)
+
+    RemoveButtons ws
+
+    Dim b As Object
+
+    Set b = ws.Buttons.Add(ws.Range("E4").Left, ws.Range("E4").Top, 130, 28)
+    b.Name = "btnLoadTransaction"
+    b.Caption = "Load Transaction"
+    b.OnAction = "LoadTransaction"
+
+    Set b = ws.Buttons.Add(ws.Range("G4").Left, ws.Range("G4").Top, 130, 28)
+    b.Name = "btnGenerateDocument"
+    b.Caption = "Generate Document"
+    b.OnAction = "GenerateDocument"
+End Sub
+
+Private Sub RemoveButtons(ByVal ws As Worksheet)
+    Dim btn As Object
+    On Error Resume Next
+    For Each btn In ws.Buttons
+        btn.Delete
+    Next btn
+    On Error GoTo 0
+End Sub
+```
+
+## PART 7 — Worksheet Code
+
+These two snippets are **code-behind** and must be pasted behind their objects in the Project Explorer, not into standard modules.
+
+### `ThisWorkbook`
+
+Keeps the working sheets hidden on open and lands on the Dashboard.
+
+```vba
+'=================================================================
+' ThisWorkbook  (code-behind)
+'
+' HOW TO INSTALL:
+'   In the VBA editor, double-click "ThisWorkbook" under
+'   VBAProject (YourFile.xlsm) in the Project Explorer and paste the
+'   code below into that code pane. Do NOT put this in a standard
+'   module — it must live behind the ThisWorkbook object to receive
+'   the Workbook_Open event.
+'=================================================================
+Option Explicit
+
+Private Sub Workbook_Open()
+    ' Keep the working sheets hidden from the user every time the file
+    ' opens, and land them on the Dashboard.
+    On Error Resume Next
+
+    If SheetExists(SHEET_PLACEHLDR) Then
+        ThisWorkbook.Worksheets(SHEET_PLACEHLDR).Visible = xlSheetVeryHidden
+    End If
+    If SheetExists(SHEET_ALT) Then
+        ThisWorkbook.Worksheets(SHEET_ALT).Visible = xlSheetVeryHidden
+    End If
+
+    If SheetExists(SHEET_DASHBOARD) Then
+        ThisWorkbook.Worksheets(SHEET_DASHBOARD).Activate
+    End If
+
+    On Error GoTo 0
+End Sub
+```
+
+### Dashboard sheet
+
+Resets the status line when the user changes the Transaction Type.
+
+```vba
+'=================================================================
+' Dashboard sheet  (code-behind)
+'
+' HOW TO INSTALL:
+'   In the VBA editor, double-click the sheet whose (Name) is the
+'   Dashboard sheet under "Microsoft Excel Objects" in the Project
+'   Explorer, and paste the code below into that sheet's code pane.
+'   It must live behind the worksheet to receive Worksheet_Change.
+'
+' BEHAVIOUR:
+'   When the user picks a different Transaction Type in C4, the status
+'   line resets to prompt them to load it.
+'=================================================================
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    ' Only react to edits of the Transaction Type cell (C4).
+    If Intersect(Target, Me.Range("C4")) Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    SetStatus "Type changed to '" & GetSelectedTransactionType() & _
+              "'. Click Load Transaction."
+    On Error GoTo 0
+End Sub
+```
+
+---
+
+## Adding a new transaction type later (the whole procedure)
+
+1. Author a Word template with `<<Placeholder>>` tags and any `<<ALT_Section_Option_START>>…_END>>` blocks. Save it as `.docx`.
+2. Put it in the `Templates` folder (or anywhere; use an absolute path).
+3. Add one row to **Config**: type name, template path, a new `Transaction_*` sheet name, description.
+4. On the Dashboard, pick the new type and click **Load Transaction**. The sheet, fields and dropdowns appear automatically.
+
+No VBA changes. Ever.
