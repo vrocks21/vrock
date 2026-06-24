@@ -1,0 +1,346 @@
+Attribute VB_Name = "modScanner"
+'=================================================================
+' modScanner
+' Loads a template via late-bound Word, harvests its text from every
+' story (body, tables, headers/footers, textboxes, shapes), parses
+' out placeholders and ALT sections, writes them to the two working
+' sheets, and triggers the transaction-sheet build.
+'
+' Word handling rule: we ALWAYS create a fresh, invisible Word
+' instance and Quit it when done. We never attach to an instance the
+' user already has open (GetObject), so we can never hide or close
+' the user's own Word session.
+'=================================================================
+Option Explicit
+
+'-----------------------------------------------------------------
+' Public entry point. Scans the template for a transaction type and
+' rebuilds its working sheets + transaction sheet.
+'-----------------------------------------------------------------
+Public Sub ScanTemplateAndBuild(ByVal transType As String)
+    Dim tplPath As String
+    Dim sheetName As String
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Dim fullText As String
+    Dim placeholders As Object       ' Dictionary: name -> True
+    Dim sections As Object           ' Dictionary: section -> clsAltSection
+
+    '--- Validate configuration before opening anything.
+    tplPath = GetResolvedTemplatePath(transType)
+    If Len(tplPath) = 0 Then
+        Err.Raise ERR_BASE + 101, "ScanTemplateAndBuild", _
+            "No template path is configured for transaction type '" & _
+            transType & "'. Add it on the Config sheet."
+    End If
+    If Not FileExists(tplPath) Then
+        Err.Raise ERR_BASE + 102, "ScanTemplateAndBuild", _
+            "Template file was not found:" & vbCrLf & tplPath
+    End If
+
+    sheetName = GetTransactionSheetForType(transType)
+    If Len(sheetName) = 0 Then
+        Err.Raise ERR_BASE + 103, "ScanTemplateAndBuild", _
+            "No transaction sheet name is configured for '" & _
+            transType & "'. Add it on the Config sheet."
+    End If
+
+    '--- Open the template (read only, invisible) and harvest text.
+    On Error GoTo CleanFail
+    Set wdApp = NewWordApp()
+    wdApp.Visible = False
+    On Error Resume Next
+    wdApp.DisplayAlerts = 0          ' wdAlertsNone
+    On Error GoTo CleanFail
+
+    Set wdDoc = wdApp.Documents.Open(FileName:=tplPath, _
+                                     ReadOnly:=True, _
+                                     AddToRecentFiles:=False, _
+                                     Visible:=False)
+
+    fullText = CollectTemplateText(wdDoc)
+
+    wdDoc.Close SaveChanges:=False   ' wdDoNotSaveChanges
+    Set wdDoc = Nothing
+    wdApp.Quit
+    Set wdApp = Nothing
+
+    '--- Parse and persist.
+    Set placeholders = NewDict()
+    Set sections = NewDict()
+    ParseTags fullText, placeholders, sections
+
+    WritePlaceholderSheet placeholders
+    WriteAltSheet sections
+
+    '--- Build the visible input sheet.
+    BuildTransactionSheet transType
+
+    Exit Sub
+
+CleanFail:
+    Dim em As String
+    em = Err.Description
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then wdApp.Quit
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+    On Error GoTo 0
+    Err.Raise ERR_BASE + 104, "ScanTemplateAndBuild", em
+End Sub
+
+'-----------------------------------------------------------------
+' Concatenates text from every story range in the document so the
+' tag parser sees a single string covering body, tables, headers,
+' footers, textboxes and shapes.
+'-----------------------------------------------------------------
+Public Function CollectTemplateText(ByVal wdDoc As Object) As String
+    Dim sb As String
+    Dim st As Object
+    Dim shp As Object
+    Dim sec As Object
+    Dim i As Long
+
+    '--- All story ranges (body + linked text box / footnote stories).
+    On Error Resume Next
+    Set st = wdDoc.StoryRanges.Item(1)   ' wdMainTextStory baseline
+    On Error GoTo 0
+
+    Dim story As Object
+    For Each story In wdDoc.StoryRanges
+        Set st = story
+        Do While Not st Is Nothing
+            sb = sb & st.Text & vbCrLf
+            Set st = st.NextStoryRange
+        Loop
+    Next story
+
+    '--- Shapes anchored in the body (text boxes etc.).
+    On Error Resume Next
+    For Each shp In wdDoc.Shapes
+        If shp.TextFrame.HasText Then
+            sb = sb & shp.TextFrame.TextRange.Text & vbCrLf
+        End If
+    Next shp
+    On Error GoTo 0
+
+    '--- Per-section headers and footers (primary / first / even) and
+    '    any shapes living inside them.
+    For Each sec In wdDoc.Sections
+        sb = sb & HeaderFooterText(sec)
+    Next sec
+
+    CollectTemplateText = sb
+End Function
+
+'-----------------------------------------------------------------
+' Returns concatenated text of all header and footer variants for a
+' section, including shapes inside those headers/footers.
+'-----------------------------------------------------------------
+Private Function HeaderFooterText(ByVal sec As Object) As String
+    Dim sb As String
+    Dim idx As Long
+    Dim hf As Object
+    Dim shp As Object
+
+    On Error Resume Next
+    ' Indices 1..3 == primary, first page, even page.
+    For idx = 1 To 3
+        Set hf = sec.Headers.Item(idx)
+        If Not hf Is Nothing Then
+            If hf.Exists Then
+                sb = sb & hf.Range.Text & vbCrLf
+                For Each shp In hf.Shapes
+                    If shp.TextFrame.HasText Then
+                        sb = sb & shp.TextFrame.TextRange.Text & vbCrLf
+                    End If
+                Next shp
+            End If
+        End If
+
+        Set hf = sec.Footers.Item(idx)
+        If Not hf Is Nothing Then
+            If hf.Exists Then
+                sb = sb & hf.Range.Text & vbCrLf
+                For Each shp In hf.Shapes
+                    If shp.TextFrame.HasText Then
+                        sb = sb & shp.TextFrame.TextRange.Text & vbCrLf
+                    End If
+                Next shp
+            End If
+        End If
+    Next idx
+    On Error GoTo 0
+
+    HeaderFooterText = sb
+End Function
+
+'-----------------------------------------------------------------
+' Parses all <<...>> tags out of text.
+'   - Tags beginning ALT_ are classified into ALT sections.
+'   - Everything else is a placeholder.
+' placeholders : Dictionary populated with name -> True (deduped).
+' sections     : Dictionary populated with section -> clsAltSection.
+'-----------------------------------------------------------------
+Public Sub ParseTags(ByVal text As String, _
+                     ByRef placeholders As Object, _
+                     ByRef sections As Object)
+    Dim re As Object, matches As Object, m As Object
+    Dim inner As String
+
+    Dim startKeys As Object, endKeys As Object
+    Set startKeys = NewDict()
+    Set endKeys = NewDict()
+
+    Set re = NewRegExp()
+    re.Global = True
+    re.IgnoreCase = False
+    re.MultiLine = True
+    re.Pattern = "<<([^<>]+?)>>"
+
+    Set matches = re.Execute(text)
+    For Each m In matches
+        inner = Trim$(m.SubMatches(0))
+        If Len(inner) = 0 Then GoTo NextMatch
+
+        If Left$(inner, 4) = "ALT_" Then
+            ClassifyAltTag inner, sections, startKeys, endKeys
+        Else
+            If Not placeholders.Exists(inner) Then placeholders.Add inner, True
+        End If
+NextMatch:
+    Next m
+
+    ValidateAltPairing startKeys, endKeys
+End Sub
+
+'-----------------------------------------------------------------
+' Classifies a single ALT tag inner-string (already stripped of <<>>).
+' Expected forms:
+'   ALT_<Section>_<Option>_START
+'   ALT_<Section>_<Option>_END
+' The Section is the text before the first underscore of the remainder
+' after "ALT_"; the Option is everything between that and the _START/
+' _END suffix. The real full key (Section_Option) is recorded on the
+' section object exactly as derived.
+'-----------------------------------------------------------------
+Private Sub ClassifyAltTag(ByVal inner As String, _
+                           ByRef sections As Object, _
+                           ByRef startKeys As Object, _
+                           ByRef endKeys As Object)
+    Dim body As String
+    Dim isStart As Boolean, isEnd As Boolean
+    Dim fullKey As String
+    Dim sectionName As String
+    Dim sec As clsAltSection
+
+    body = Mid$(inner, 5)            ' drop leading "ALT_"
+
+    If Right$(body, 6) = "_START" Then
+        isStart = True
+        fullKey = Left$(body, Len(body) - 6)
+    ElseIf Right$(body, 4) = "_END" Then
+        isEnd = True
+        fullKey = Left$(body, Len(body) - 4)
+    Else
+        ' Not a well-formed START/END marker: ignore quietly.
+        Exit Sub
+    End If
+
+    If Len(fullKey) = 0 Then Exit Sub
+
+    sectionName = SectionFromKey(fullKey)
+
+    If sections.Exists(sectionName) Then
+        Set sec = sections.Item(sectionName)
+    Else
+        Set sec = New clsAltSection
+        sec.SectionName = sectionName
+        sections.Add sectionName, sec
+    End If
+    sec.AddKey fullKey
+
+    If isStart Then
+        If Not startKeys.Exists(fullKey) Then startKeys.Add fullKey, True
+    ElseIf isEnd Then
+        If Not endKeys.Exists(fullKey) Then endKeys.Add fullKey, True
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Non-fatal validation that every START has an END and vice versa.
+' Broken structures are surfaced to the user but do not abort the
+' load, so they can still inspect and fix the template.
+'-----------------------------------------------------------------
+Private Sub ValidateAltPairing(ByVal startKeys As Object, _
+                               ByVal endKeys As Object)
+    Dim k As Variant, missing As String
+
+    For Each k In startKeys.Keys
+        If Not endKeys.Exists(k) Then
+            missing = missing & " - <<ALT_" & k & "_START>> has no matching _END" & vbCrLf
+        End If
+    Next k
+    For Each k In endKeys.Keys
+        If Not startKeys.Exists(k) Then
+            missing = missing & " - <<ALT_" & k & "_END>> has no matching _START" & vbCrLf
+        End If
+    Next k
+
+    If Len(missing) > 0 Then
+        MsgBox "Warning: the template has unbalanced ALT markers." & vbCrLf & vbCrLf & _
+               missing & vbCrLf & _
+               "These sections may not behave correctly. You can still " & _
+               "continue, but consider fixing the template.", _
+               vbExclamation, "ALT structure check"
+    End If
+End Sub
+
+'-----------------------------------------------------------------
+' Writes the deduped placeholder names into the very-hidden
+' wPlaceholders sheet (one name per row in column A from row 2).
+'-----------------------------------------------------------------
+Public Sub WritePlaceholderSheet(ByVal placeholders As Object)
+    Dim ws As Worksheet, r As Long, k As Variant
+    Set ws = EnsureSheet(SHEET_PLACEHLDR, False)
+    ws.Cells.Clear
+    ws.Range("A1").Value = "PlaceholderName"
+
+    r = 2
+    For Each k In placeholders.Keys
+        ws.Cells(r, 1).Value = CStr(k)
+        r = r + 1
+    Next k
+End Sub
+
+'-----------------------------------------------------------------
+' Writes ALT sections into the very-hidden wAlt sheet:
+'   A = Section, B = Option label, C = real full key.
+' One row per option key. Used to build dropdowns and to drive block
+' keep/delete during generation.
+'-----------------------------------------------------------------
+Public Sub WriteAltSheet(ByVal sections As Object)
+    Dim ws As Worksheet, r As Long
+    Dim secKey As Variant, keyVar As Variant
+    Dim sec As clsAltSection
+    Dim fullKey As String
+
+    Set ws = EnsureSheet(SHEET_ALT, False)
+    ws.Cells.Clear
+    ws.Range("A1").Value = "Section"
+    ws.Range("B1").Value = "OptionLabel"
+    ws.Range("C1").Value = "FullKey"
+
+    r = 2
+    For Each secKey In sections.Keys
+        Set sec = sections.Item(secKey)
+        For Each keyVar In sec.Keys
+            fullKey = CStr(keyVar)
+            ws.Cells(r, 1).Value = sec.SectionName
+            ws.Cells(r, 2).Value = OptionLabelFromKey(fullKey)
+            ws.Cells(r, 3).Value = fullKey
+            r = r + 1
+        Next keyVar
+    Next secKey
+End Sub
